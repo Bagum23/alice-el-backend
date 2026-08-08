@@ -1,10 +1,14 @@
 import os
+import time
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
 app = Flask(__name__)
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    timeout=3.2
+)
 
 
 @app.get("/")
@@ -17,40 +21,67 @@ def health():
 
 @app.post("/ask")
 def ask():
+    started = time.time()
+
     try:
         data = request.get_json(silent=True) or {}
 
-        # Запрос из Яндекс Диалогов
         is_alice = "request" in data and "session" in data
 
         if is_alice:
-            alice_request = data.get("request", {})
+            req = data.get("request", {})
+
             text = (
-                alice_request.get("command")
-                or alice_request.get("original_utterance")
+                req.get("command")
+                or req.get("original_utterance")
                 or ""
             ).strip()
+
         else:
-            # Наш старый тестовый формат {"text": "..."}
             text = data.get("text", "").strip()
 
+        print(f"INPUT: {text}", flush=True)
+
         if not text:
-            if is_alice:
-                answer = "Я готов. Задайте мне вопрос."
-            else:
-                return jsonify({"error": "No text provided"}), 400
+            answer = "Привет! Чем могу помочь?"
         else:
+            openai_started = time.time()
+
             response = client.responses.create(
                 model="gpt-5-mini",
-                input=text
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты голосовой помощник Эл. "
+                            "Отвечай по-русски, кратко и по существу. "
+                            "Обычно не более 2-3 предложений."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": text
+                    }
+                ]
             )
+
             answer = response.output_text.strip()
 
-        # Формат ответа для Алисы
-        if is_alice:
-            # Алиса принимает максимум 1024 символа в response.text
-            answer = answer[:1024]
+            print(
+                f"OPENAI TIME: {time.time() - openai_started:.2f}s",
+                flush=True
+            )
 
+        if not answer:
+            answer = "Не удалось сформировать ответ."
+
+        # Для голосового интерфейса длинные ответы не нужны
+        answer = answer[:900]
+
+        total_time = time.time() - started
+        print(f"TOTAL TIME: {total_time:.2f}s", flush=True)
+
+        if is_alice:
             return jsonify({
                 "response": {
                     "text": answer,
@@ -61,12 +92,39 @@ def ask():
                 "version": data.get("version", "1.0")
             })
 
-        # Старый формат для PowerShell-теста
         return jsonify({
             "answer": answer
         })
 
     except Exception as e:
+        total_time = time.time() - started
+
+        print(
+            f"ERROR after {total_time:.2f}s: {repr(e)}",
+            flush=True
+        )
+
+        # Алисе лучше вернуть корректный ответ,
+        # чем HTTP 500
+        data = request.get_json(silent=True) or {}
+        is_alice = "request" in data and "session" in data
+
+        if is_alice:
+            fallback = (
+                "Ответ занял слишком много времени. "
+                "Попробуйте задать вопрос ещё раз."
+            )
+
+            return jsonify({
+                "response": {
+                    "text": fallback,
+                    "tts": fallback,
+                    "end_session": False
+                },
+                "session": data.get("session", {}),
+                "version": data.get("version", "1.0")
+            })
+
         return jsonify({
             "error": str(e)
         }), 500
