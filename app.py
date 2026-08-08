@@ -47,23 +47,21 @@ def ask():
         else:
             openai_started = time.time()
 
-            response = client.responses.create(
-                model="gpt-5-mini",
-                input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты голосовой помощник Эл. "
-                            "Отвечай по-русски, кратко и по существу. "
-                            "Обычно не более 2-3 предложений."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ]
-            )
+response = client.responses.create(
+    model="gpt-5.6-terra",
+    instructions=(
+        "Ты голосовой помощник Эл. "
+        "Отвечай по-русски очень кратко и по существу. "
+        "Один-два коротких предложения. "
+        "Не более 35 слов. "
+        "Не используй списки, markdown и длинные вступления."
+    ),
+    input=text,
+    reasoning={
+        "effort": "low"
+    },
+    max_output_tokens=120
+)
 
             answer = response.output_text.strip()
 
