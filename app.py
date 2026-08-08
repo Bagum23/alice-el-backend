@@ -7,15 +7,16 @@ app = Flask(__name__)
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    timeout=4.0
+    timeout=3.8
 )
 
-# Простая память диалога в RAM.
-# Ключ = session_id Яндекс Диалогов
-# Значение = список последних сообщений
+# Память по сессиям Яндекс Диалогов.
+# Для тестов этого достаточно.
 sessions = {}
 
-MAX_HISTORY_MESSAGES = 8
+# Храним последние 6 сообщений:
+# 3 реплики пользователя + 3 ответа Эла.
+MAX_HISTORY_MESSAGES = 6
 
 
 @app.get("/")
@@ -24,6 +25,36 @@ def health():
         "status": "ok",
         "service": "alice-el-backend"
     })
+
+
+def build_messages(history, text):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты голосовой помощник Эл. "
+                "Отвечай как умный разговорный ассистент на русском языке. "
+                "Всегда учитывай предыдущий контекст разговора. "
+                "Если пользователь говорит 'он', 'она', 'у него', 'у нее', "
+                "'это', 'там', 'тот', 'эта' и подобные слова, "
+                "определи, к чему они относятся из предыдущих реплик. "
+                "Не задавай уточняющий вопрос, если смысл можно понять "
+                "из контекста. "
+                "Отвечай коротко и естественно: обычно 1-3 предложения. "
+                "Для простых фактических вопросов давай прямой ответ сразу. "
+                "Не используй markdown, таблицы и длинные списки."
+            )
+        }
+    ]
+
+    messages.extend(history)
+
+    messages.append({
+        "role": "user",
+        "content": text
+    })
+
+    return messages
 
 
 @app.post("/ask")
@@ -38,13 +69,14 @@ def ask():
             and "session" in data
         )
 
-        session_id = "default"
-
         if is_alice:
             req = data.get("request", {})
             session = data.get("session", {})
 
-            session_id = session.get("session_id", "default")
+            session_id = session.get(
+                "session_id",
+                "default"
+            )
 
             text = (
                 req.get("command")
@@ -53,7 +85,12 @@ def ask():
             ).strip()
 
         else:
-            text = data.get("text", "").strip()
+            session_id = "manual-test"
+
+            text = data.get(
+                "text",
+                ""
+            ).strip()
 
         print(
             f"SESSION: {session_id} | INPUT: {text}",
@@ -64,57 +101,51 @@ def ask():
             answer = "Привет! Чем могу помочь?"
 
         else:
-            history = sessions.get(session_id, [])
+            history = sessions.get(
+                session_id,
+                []
+            )
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты голосовой помощник Эл. "
-                        "Ты работаешь через Яндекс Алису, но ответы формируешь сам. "
-                        "Отвечай по-русски естественно, умно и по существу. "
-                        "Обязательно учитывай предыдущие реплики диалога. "
-                        "Если пользователь говорит 'он', 'она', 'у неё', "
-                        "'у него', 'это', 'там' и подобные слова, "
-                        "определи, к чему они относятся из предыдущего контекста. "
-                        "Не задавай уточняющий вопрос, если смысл очевиден из истории. "
-                        "Для голосового ответа обычно используй 1-3 коротких предложения. "
-                        "Не используй markdown, таблицы и длинные списки."
-                    )
-                }
-            ]
-
-            messages.extend(history)
-
-            messages.append({
-                "role": "user",
-                "content": text
-            })
+            messages = build_messages(
+                history,
+                text
+            )
 
             openai_started = time.time()
 
             response = client.responses.create(
                 model="gpt-5-mini",
                 input=messages,
-                reasoning={
-                    "effort": "low"
-                },
-                max_output_tokens=140
+                max_output_tokens=300
             )
 
-            answer = response.output_text.strip()
-
-            openai_time = time.time() - openai_started
+            openai_time = (
+                time.time()
+                - openai_started
+            )
 
             print(
                 f"OPENAI TIME: {openai_time:.2f}s",
                 flush=True
             )
 
-            if not answer:
-                answer = "Не удалось сформировать ответ."
+            answer = (
+                response.output_text
+                or ""
+            ).strip()
 
-            # Добавляем текущий обмен в память
+            if not answer:
+                print(
+                    "EMPTY OPENAI OUTPUT",
+                    flush=True
+                )
+
+                answer = (
+                    "Не удалось быстро сформировать ответ. "
+                    "Попробуйте повторить вопрос."
+                )
+
+            # Запоминаем только успешный обмен.
             history.append({
                 "role": "user",
                 "content": text
@@ -125,16 +156,17 @@ def ask():
                 "content": answer
             })
 
-            # Оставляем только последние сообщения,
-            # чтобы не раздувать контекст и не замедлять ответы
-            history = history[-MAX_HISTORY_MESSAGES:]
+            sessions[session_id] = (
+                history[-MAX_HISTORY_MESSAGES:]
+            )
 
-            sessions[session_id] = history
+        # Алисе длинный текст не нужен.
+        answer = answer[:800]
 
-        # Для голосового интерфейса держим ответ коротким
-        answer = answer[:900]
-
-        total_time = time.time() - started
+        total_time = (
+            time.time()
+            - started
+        )
 
         print(
             f"TOTAL TIME: {total_time:.2f}s",
@@ -148,8 +180,14 @@ def ask():
                     "tts": answer,
                     "end_session": False
                 },
-                "session": data.get("session", {}),
-                "version": data.get("version", "1.0")
+                "session": data.get(
+                    "session",
+                    {}
+                ),
+                "version": data.get(
+                    "version",
+                    "1.0"
+                )
             })
 
         return jsonify({
@@ -157,14 +195,22 @@ def ask():
         })
 
     except Exception as e:
-        total_time = time.time() - started
+        total_time = (
+            time.time()
+            - started
+        )
 
         print(
             f"ERROR after {total_time:.2f}s: {repr(e)}",
             flush=True
         )
 
-        data = request.get_json(silent=True) or {}
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
+        )
 
         is_alice = (
             "request" in data
@@ -174,7 +220,7 @@ def ask():
         if is_alice:
             fallback = (
                 "Ответ занял слишком много времени. "
-                "Попробуйте повторить вопрос."
+                "Повторите вопрос."
             )
 
             return jsonify({
@@ -183,8 +229,14 @@ def ask():
                     "tts": fallback,
                     "end_session": False
                 },
-                "session": data.get("session", {}),
-                "version": data.get("version", "1.0")
+                "session": data.get(
+                    "session",
+                    {}
+                ),
+                "version": data.get(
+                    "version",
+                    "1.0"
+                )
             })
 
         return jsonify({
@@ -193,7 +245,12 @@ def ask():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
