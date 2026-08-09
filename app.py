@@ -10,56 +10,83 @@ app = Flask(__name__)
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    timeout=5.5,
+    timeout=4.2,
     max_retries=0
 )
 
+# История диалога и очередь непроговоренных частей.
 sessions = {}
+
+MAX_HISTORY_ITEMS = 10
+
+# Оставляем хороший запас до лимита Алисы 1024 символа.
+CHUNK_TARGET = 760
+CHUNK_HARD_MAX = 900
 
 
 SYSTEM_PROMPT = """
 Ты голосовой помощник Эл.
 
-Ты работаешь внутри голосового интерфейса Алисы,
-но ответы формируешь самостоятельно через OpenAI.
+Ты работаешь через голосовой интерфейс Алисы,
+но ответы формируешь самостоятельно.
 
-Отвечай по-русски естественно, точно и по существу.
+Отвечай по-русски, естественно, точно и по существу.
 
 Всегда учитывай предыдущий контекст разговора.
 
 Если пользователь говорит "он", "она", "у него", "у неё",
-"ему", "ей", "там", "это", "тот", "эта" и подобные слова,
-определи, к чему они относятся из предыдущих реплик.
+"ему", "ей", "это", "там", "тот", "эта" и подобные слова,
+определи объект из предыдущих реплик.
 
-Не задавай уточняющий вопрос, если смысл очевиден из контекста.
+Выбирай длину ответа по смыслу вопроса.
 
-Выбирай длину ответа по смыслу:
-- простой факт — короткий прямой ответ;
-- обычное объяснение — законченный ответ средней длины;
-- анализ, прогноз, сравнение, подробный рассказ — более развёрнутый ответ.
+Простой факт — краткий прямой ответ.
+Обычное объяснение — законченный ответ средней длины.
+Анализ, прогноз, сравнение, маршрут или подробный рассказ —
+развёрнутый законченный ответ.
 
-Не сокращай основной ответ настолько, чтобы пользователю
-приходилось говорить "продолжай", чтобы получить суть.
+Не сокращай содержательную часть только из-за голосового интерфейса:
+backend самостоятельно разобьёт длинный текст на несколько голосовых частей.
 
-Если пользователь говорит "продолжай" — продолжай предыдущую
-мысль без повторения начала.
-Если говорит "подробнее" — добавь существенные детали.
-Если говорит "короче" — дай краткое резюме.
-Если говорит "объясни проще" — переформулируй простыми словами.
-
-Не используй Markdown, таблицы и служебные пояснения.
-Не называй себя Алисой.
+Пиши нормальными законченными предложениями.
+Не обрывай предложение посередине.
+Не используй Markdown, таблицы и сложное форматирование.
 Избегай воды и повторов.
+Не называй себя Алисой.
 """
 
 
-def alice_response(text, end_session=False):
+CONTINUE_WORDS = {
+    "продолжай",
+    "дальше",
+    "еще",
+    "ещё",
+    "да",
+    "продолжить",
+    "рассказывай дальше"
+}
+
+
+def alice_response(text, has_more=False):
+    response = {
+        "text": text,
+        "tts": text,
+        "end_session": False
+    }
+
+    if has_more:
+        response["buttons"] = [
+            {
+                "title": "Продолжить",
+                "payload": {
+                    "action": "continue"
+                },
+                "hide": True
+            }
+        ]
+
     return jsonify({
-        "response": {
-            "text": text,
-            "tts": text,
-            "end_session": end_session
-        },
+        "response": response,
         "version": "1.0"
     })
 
@@ -108,72 +135,168 @@ def quick_answer(text):
 
 
 def choose_output_budget(text):
-    """
-    Определяем необходимую длину ответа.
-    Возвращаем max_output_tokens.
-    """
-
     t = text.lower().strip()
 
-    # Явно развёрнутые запросы
     long_markers = (
         "проанализируй",
         "анализ",
         "сравни",
-        "сравнение",
         "прогноз",
         "спрогнозируй",
         "расскажи подробно",
-        "расскажи подробнее",
         "объясни подробно",
         "подробно",
-        "история",
-        "перечисли основные",
-        "что можешь сказать",
-        "какая осень",
-        "какой прогноз",
         "за последние",
+        "маршрут",
+        "опиши маршрут",
+        "что можешь сказать",
         "плюсы и минусы"
     )
 
-    if any(marker in t for marker in long_markers):
-        return 420
+    if any(x in t for x in long_markers):
+        return 500
 
-    # Команды продолжения/расширения
-    medium_long_markers = (
-        "продолжай",
-        "подробнее",
+    medium_markers = (
         "расскажи",
         "объясни",
         "почему",
         "как лучше",
         "что делать",
         "чем знаменит",
-        "в какое время",
-        "какие бывают"
+        "какие места",
+        "рекомендуешь"
     )
 
-    if any(marker in t for marker in medium_long_markers):
-        return 280
+    if any(x in t for x in medium_markers):
+        return 320
 
-    # Короткий фактический вопрос
     short_markers = (
         "сколько",
         "когда",
         "кто",
         "где",
         "какая столица",
-        "какой год",
-        "сколько лет",
-        "сколько ног",
-        "сколько глаз"
+        "сколько лет"
     )
 
-    if any(marker in t for marker in short_markers):
-        return 140
+    if any(x in t for x in short_markers):
+        return 180
 
-    # Обычный вопрос
-    return 220
+    return 260
+
+
+def split_sentences(text):
+    """
+    Делит текст на предложения, сохраняя ., !, ?, …
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return []
+
+    parts = re.split(
+        r'(?<=[.!?…])\s+',
+        text
+    )
+
+    return [
+        part.strip()
+        for part in parts
+        if part.strip()
+    ]
+
+
+def split_into_chunks(text):
+    """
+    Собирает голосовые части только по границам предложений.
+    Стараемся держаться около CHUNK_TARGET.
+    """
+    sentences = split_sentences(text)
+
+    if not sentences:
+        return [text.strip()] if text.strip() else []
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        candidate = (
+            sentence
+            if not current
+            else current + " " + sentence
+        )
+
+        if len(candidate) <= CHUNK_TARGET:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        # Редкий случай: одно предложение само длиннее лимита.
+        # Сначала пытаемся разделить его по ; : , —
+        if len(sentence) > CHUNK_HARD_MAX:
+            subparts = re.split(
+                r'(?<=[;:,—])\s+',
+                sentence
+            )
+
+            subcurrent = ""
+
+            for part in subparts:
+                candidate2 = (
+                    part
+                    if not subcurrent
+                    else subcurrent + " " + part
+                )
+
+                if len(candidate2) <= CHUNK_HARD_MAX:
+                    subcurrent = candidate2
+                else:
+                    if subcurrent:
+                        chunks.append(subcurrent)
+
+                    # Только как самый крайний fallback:
+                    # не превышаем технический предел.
+                    while len(part) > CHUNK_HARD_MAX:
+                        cut = part.rfind(
+                            " ",
+                            0,
+                            CHUNK_HARD_MAX
+                        )
+
+                        if cut < 200:
+                            cut = CHUNK_HARD_MAX
+
+                        chunks.append(
+                            part[:cut].strip()
+                        )
+
+                        part = part[cut:].strip()
+
+                    subcurrent = part
+
+            if subcurrent:
+                current = subcurrent
+
+        else:
+            current = sentence
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def get_session(session_id):
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "history": [],
+            "pending_chunks": []
+        }
+
+    return sessions[session_id]
 
 
 @app.get("/")
@@ -201,22 +324,82 @@ def ask():
             req = data.get("request", {})
             session = data.get("session", {})
 
+            session_id = session.get(
+                "session_id",
+                "default"
+            )
+
+            payload = req.get("payload") or {}
+
             text = (
-                req.get("original_utterance")
-                or req.get("command")
+                req.get("command")
+                or req.get("original_utterance")
                 or ""
             ).strip()
 
-            session_id = session.get("session_id", "default")
+            continue_by_button = (
+                payload.get("action") == "continue"
+            )
 
         else:
-            text = str(data.get("text", "")).strip()
-            session_id = str(data.get("session_id", "default"))
+            session_id = str(
+                data.get("session_id", "manual")
+            )
+
+            text = str(
+                data.get("text", "")
+            ).strip()
+
+            continue_by_button = False
 
         print(
             f"SESSION: {session_id} | INPUT: {text}",
             flush=True
         )
+
+        state = get_session(session_id)
+
+        # ------------------------------------------------
+        # Есть непроговоренные части предыдущего ответа
+        # ------------------------------------------------
+
+        wants_continue = (
+            continue_by_button
+            or text.lower().strip() in CONTINUE_WORDS
+        )
+
+        if wants_continue and state["pending_chunks"]:
+            next_chunk = state["pending_chunks"].pop(0)
+
+            has_more = bool(
+                state["pending_chunks"]
+            )
+
+            print(
+                f"PENDING CHUNK SENT | "
+                f"REMAINING: {len(state['pending_chunks'])}",
+                flush=True
+            )
+
+            if is_alice:
+                return alice_response(
+                    next_chunk,
+                    has_more=has_more
+                )
+
+            return jsonify({
+                "answer": next_chunk,
+                "has_more": has_more
+            })
+
+        # Если пользователь задал новый вопрос,
+        # старую очередь продолжений сбрасываем.
+        if text and not wants_continue:
+            state["pending_chunks"] = []
+
+        # ------------------------------------------------
+        # Пустой запрос
+        # ------------------------------------------------
 
         if not text:
             answer = "Привет! Я Эл. Чем могу помочь?"
@@ -224,20 +407,34 @@ def ask():
             if is_alice:
                 return alice_response(answer)
 
-            return jsonify({"answer": answer})
+            return jsonify({
+                "answer": answer
+            })
 
-        answer = quick_answer(text)
+        # ------------------------------------------------
+        # Быстрый локальный ответ
+        # ------------------------------------------------
 
-        if answer:
-            print("LOCAL ANSWER", flush=True)
+        quick = quick_answer(text)
+
+        if quick:
+            print(
+                "LOCAL ANSWER",
+                flush=True
+            )
 
             if is_alice:
-                return alice_response(answer)
+                return alice_response(quick)
 
-            return jsonify({"answer": answer})
+            return jsonify({
+                "answer": quick
+            })
 
-        history = sessions.get(session_id, [])
-        history = history[-8:]
+        # ------------------------------------------------
+        # История
+        # ------------------------------------------------
+
+        history = state["history"][-MAX_HISTORY_ITEMS:]
 
         conversation = []
 
@@ -259,6 +456,10 @@ def ask():
             flush=True
         )
 
+        # ------------------------------------------------
+        # OpenAI
+        # ------------------------------------------------
+
         openai_started = time.time()
 
         try:
@@ -270,10 +471,13 @@ def ask():
                     "effort": "low"
                 },
                 max_output_tokens=output_budget,
-                timeout=5.5
+                timeout=4.2
             )
 
-            answer = (response.output_text or "").strip()
+            full_answer = (
+                response.output_text
+                or ""
+            ).strip()
 
             print(
                 f"OPENAI TIME: "
@@ -282,14 +486,17 @@ def ask():
             )
 
         except APITimeoutError:
-            elapsed = time.time() - openai_started
+            elapsed = (
+                time.time()
+                - openai_started
+            )
 
             print(
                 f"OPENAI TIMEOUT after {elapsed:.2f}s",
                 flush=True
             )
 
-            answer = (
+            full_answer = (
                 "Ответ формируется дольше обычного. "
                 "Повторите вопрос."
             )
@@ -301,7 +508,7 @@ def ask():
                 flush=True
             )
 
-            answer = (
+            full_answer = (
                 "Сейчас не удалось получить ответ. "
                 "Повторите вопрос."
             )
@@ -313,16 +520,21 @@ def ask():
                 flush=True
             )
 
-            answer = (
+            full_answer = (
                 "Сейчас не удалось получить ответ. "
                 "Повторите вопрос."
             )
 
-        if not answer:
-            answer = (
+        if not full_answer:
+            full_answer = (
                 "Не удалось сформировать ответ. "
                 "Повторите вопрос."
             )
+
+        # ------------------------------------------------
+        # Запоминаем ПОЛНЫЙ ответ,
+        # а не только первый голосовой кусок
+        # ------------------------------------------------
 
         history.append({
             "role": "user",
@@ -331,12 +543,47 @@ def ask():
 
         history.append({
             "role": "assistant",
-            "content": answer
+            "content": full_answer
         })
 
-        sessions[session_id] = history[-10:]
+        state["history"] = (
+            history[-MAX_HISTORY_ITEMS:]
+        )
 
-        total_time = time.time() - started
+        # ------------------------------------------------
+        # Разбиваем ответ по предложениям
+        # ------------------------------------------------
+
+        chunks = split_into_chunks(
+            full_answer
+        )
+
+        if not chunks:
+            chunks = [
+                "Не удалось сформировать ответ."
+            ]
+
+        first_chunk = chunks[0]
+
+        state["pending_chunks"] = (
+            chunks[1:]
+        )
+
+        has_more = bool(
+            state["pending_chunks"]
+        )
+
+        print(
+            f"CHUNKS: {len(chunks)} | "
+            f"FIRST LENGTH: {len(first_chunk)} | "
+            f"REMAINING: {len(state['pending_chunks'])}",
+            flush=True
+        )
+
+        total_time = (
+            time.time()
+            - started
+        )
 
         print(
             f"TOTAL TIME: {total_time:.2f}s",
@@ -344,10 +591,14 @@ def ask():
         )
 
         if is_alice:
-            return alice_response(answer)
+            return alice_response(
+                first_chunk,
+                has_more=has_more
+            )
 
         return jsonify({
-            "answer": answer
+            "answer": first_chunk,
+            "has_more": has_more
         })
 
     except Exception as e:
@@ -358,9 +609,14 @@ def ask():
         )
 
         try:
-            data = request.get_json(silent=True) or {}
+            data = request.get_json(
+                silent=True
+            ) or {}
 
-            if "request" in data and "session" in data:
+            if (
+                "request" in data
+                and "session" in data
+            ):
                 return alice_response(
                     "Произошла ошибка. Повторите вопрос."
                 )
@@ -374,7 +630,12 @@ def ask():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
