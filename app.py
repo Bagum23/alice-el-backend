@@ -77,6 +77,34 @@ CONTINUE_WORDS = {
 }
 
 
+DONE_CHECK_WORDS = {
+    "все",
+    "всё",
+    "это все",
+    "это всё",
+    "это вся информация",
+    "это вся информация по текущему запросу",
+    "это все по текущему запросу",
+    "это всё по текущему запросу",
+    "это полный ответ",
+    "больше ничего",
+    "это всё?",
+    "это все?"
+}
+
+
+THANKS_WORDS = {
+    "спасибо",
+    "ок спасибо",
+    "хорошо спасибо",
+    "понял спасибо",
+    "понятно спасибо",
+    "благодарю",
+    "спасибо эл",
+    "окей спасибо"
+}
+
+
 # =========================================================
 # TEXT HELPERS
 # =========================================================
@@ -374,13 +402,7 @@ def get_session(session_id):
         sessions[session_id] = {
             "history": [],
             "pending_chunks": [],
-
-            # ID последнего Responses API ответа,
-            # если он оборвался по max_output_tokens.
             "previous_response_id": None,
-
-            # Нужно ли модели реально продолжить
-            # незавершённый ответ после исчерпания chunks.
             "needs_model_continuation": False
         }
 
@@ -398,10 +420,6 @@ def alice_response(
 ):
     spoken_text = text.strip()
 
-    # Продолжение предлагаем, если:
-    # 1. есть уже готовый следующий chunk
-    # либо
-    # 2. модель сама не закончила ответ из-за token limit.
     should_offer_continue = (
         has_more
         or model_can_continue
@@ -537,6 +555,77 @@ def ask():
 
 
         # =================================================
+        # ЛОКАЛЬНО: "ЭТО ВСЁ?"
+        # =================================================
+
+        if normalized_text in DONE_CHECK_WORDS:
+            has_more = bool(
+                state["pending_chunks"]
+            )
+
+            model_can_continue = (
+                state["needs_model_continuation"]
+            )
+
+            if has_more or model_can_continue:
+                answer = (
+                    "Нет, информация ещё осталась."
+                )
+
+                print(
+                    "LOCAL DONE CHECK: MORE CONTENT",
+                    flush=True
+                )
+
+            else:
+                answer = (
+                    "Да, это полный ответ "
+                    "по текущему запросу."
+                )
+
+                print(
+                    "LOCAL DONE CHECK: COMPLETE",
+                    flush=True
+                )
+
+            if is_alice:
+                return alice_response(
+                    answer,
+                    has_more=has_more,
+                    model_can_continue=model_can_continue
+                )
+
+            return jsonify({
+                "answer": answer,
+                "has_more": has_more,
+                "model_can_continue":
+                    model_can_continue
+            })
+
+
+        # =================================================
+        # ЛОКАЛЬНО: СПАСИБО
+        # =================================================
+
+        if normalized_text in THANKS_WORDS:
+            answer = "Пожалуйста!"
+
+            print(
+                "LOCAL THANKS",
+                flush=True
+            )
+
+            if is_alice:
+                return alice_response(
+                    answer
+                )
+
+            return jsonify({
+                "answer": answer
+            })
+
+
+        # =================================================
         # 1. СНАЧАЛА ВЫДАЁМ ГОТОВЫЙ PENDING CHUNK
         # =================================================
 
@@ -583,8 +672,7 @@ def ask():
 
 
         # =================================================
-        # 2. PENDING CHUNKS ЗАКОНЧИЛИСЬ,
-        #    НО OPENAI САМ НЕ ЗАКОНЧИЛ ОТВЕТ
+        # 2. OPENAI ДОЛЖЕН ПРОДОЛЖИТЬ НЕЗАВЕРШЁННЫЙ ОТВЕТ
         # =================================================
 
         if (
@@ -620,7 +708,8 @@ def ask():
 
                     max_output_tokens=420,
 
-                    timeout=4.2
+                    # Для продолжения даём чуть больше времени.
+                    timeout=5.5
                 )
 
                 full_answer = (
@@ -665,8 +754,14 @@ def ask():
                 )
 
             except APITimeoutError:
+                elapsed = (
+                    time.time()
+                    - openai_started
+                )
+
                 print(
-                    "MODEL CONTINUATION TIMEOUT",
+                    "MODEL CONTINUATION TIMEOUT after "
+                    f"{elapsed:.2f}s",
                     flush=True
                 )
 
@@ -676,9 +771,6 @@ def ask():
                     "Попробуйте ещё раз."
                 )
 
-                # Не сбрасываем флаг:
-                # следующая попытка "продолжай"
-                # сможет повторить continuation.
                 state["needs_model_continuation"] = True
 
             except APIError as e:
@@ -756,9 +848,7 @@ def ask():
 
 
         # =================================================
-        # 3. ЕСЛИ ОТВЕТ УЖЕ БЫЛ ПОЛНОСТЬЮ ЗАКОНЧЕН,
-        #    "ПРОДОЛЖАЙ" НЕ ДОЛЖНО ПОРОЖДАТЬ
-        #    БЕСКОНЕЧНЫЙ НОВЫЙ ТЕКСТ
+        # 3. "ПРОДОЛЖАЙ", НО ОТВЕТ УЖЕ ПОЛНЫЙ
         # =================================================
 
         if (
@@ -1049,7 +1139,6 @@ def ask():
                 "Не удалось сформировать ответ."
             ]
 
-
         first_chunk = chunks[0]
 
         state["pending_chunks"] = (
@@ -1065,7 +1154,6 @@ def ask():
             and state["needs_model_continuation"]
         )
 
-
         print(
             f"CHUNKS: {len(chunks)} | "
             f"LENGTHS: "
@@ -1076,7 +1164,6 @@ def ask():
             f"{state['needs_model_continuation']}",
             flush=True
         )
-
 
         total_time = (
             time.time()
@@ -1089,14 +1176,12 @@ def ask():
             flush=True
         )
 
-
         if is_alice:
             return alice_response(
                 first_chunk,
                 has_more=has_more,
                 model_can_continue=model_can_continue
             )
-
 
         return jsonify({
             "answer": first_chunk,
