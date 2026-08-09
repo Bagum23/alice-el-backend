@@ -66,7 +66,7 @@ def warmup_openai():
             reasoning={
                 "effort": "none"
             },
-            max_output_tokens=8,
+            max_output_tokens=16,
 
             # Warmup не ограничен таймаутом webhook Алисы.
             timeout=10.0
