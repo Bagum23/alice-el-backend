@@ -11,17 +11,17 @@ app = Flask(__name__)
 
 MODEL_NAME = "gpt-5.6-luna"
 
+
+# =========================================================
+# OPENAI CLIENT
+# =========================================================
+
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
     timeout=4.2,
     max_retries=0
 )
 
-threading.Thread(
-    target=warmup_openai,
-    name="openai-warmup",
-    daemon=True
-).start()
 
 # =========================================================
 # OPENAI STARTUP WARMUP
@@ -35,8 +35,10 @@ def warmup_openai():
     """
     Один короткий запрос к OpenAI после запуска worker.
 
-    Нужен для прогрева исходящего HTTP/TLS-соединения
-    Render -> OpenAI до первого реального вопроса пользователя.
+    Ждём 3 секунды, чтобы не конкурировать
+    с запуском Gunicorn / Render.
+
+    Warmup выполняется один раз на процесс worker.
     """
 
     global _warmup_started
@@ -47,7 +49,7 @@ def warmup_openai():
 
         _warmup_started = True
 
-    # Даём Gunicorn / Render спокойно закончить запуск.
+    # Даём Gunicorn и Render спокойно закончить запуск.
     time.sleep(3.0)
 
     started = time.time()
@@ -66,8 +68,7 @@ def warmup_openai():
             },
             max_output_tokens=8,
 
-            # Warmup не связан с лимитом webhook Алисы,
-            # поэтому можно спокойно дать ему больше времени.
+            # Warmup не ограничен таймаутом webhook Алисы.
             timeout=10.0
         )
 
@@ -90,6 +91,16 @@ def warmup_openai():
             flush=True
         )
 
+
+# Функция warmup_openai УЖЕ определена выше.
+# Только теперь запускаем поток.
+threading.Thread(
+    target=warmup_openai,
+    name="openai-warmup",
+    daemon=True
+).start()
+
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -103,6 +114,10 @@ CHUNK_HARD_MAX = 900
 
 CONTINUE_PROMPT = "Продолжить?"
 
+
+# =========================================================
+# SYSTEM PROMPT
+# =========================================================
 
 SYSTEM_PROMPT = """
 Ты голосовой помощник Эл.
@@ -137,6 +152,10 @@ Backend самостоятельно разобьёт длинный текст
 """
 
 
+# =========================================================
+# LOCAL COMMANDS
+# =========================================================
+
 CONTINUE_WORDS = {
     "продолжай",
     "продолжить",
@@ -160,9 +179,7 @@ DONE_CHECK_WORDS = {
     "это все по текущему запросу",
     "это всё по текущему запросу",
     "это полный ответ",
-    "больше ничего",
-    "это всё?",
-    "это все?"
+    "больше ничего"
 }
 
 
@@ -249,6 +266,10 @@ def quick_answer(text):
 
     return None
 
+
+# =========================================================
+# DYNAMIC OUTPUT BUDGET
+# =========================================================
 
 def choose_output_budget(text):
     t = normalize_command(text)
@@ -357,12 +378,16 @@ def split_oversized_sentence(sentence):
             continue
 
         if current:
-            chunks.append(current.strip())
+            chunks.append(
+                current.strip()
+            )
 
         current = part
 
     if current:
-        chunks.append(current.strip())
+        chunks.append(
+            current.strip()
+        )
 
     final_chunks = []
 
@@ -401,13 +426,17 @@ def split_into_chunks(text):
     sentences = split_sentences(text)
 
     if not sentences:
-        return [text.strip()] if text.strip() else []
+        return [
+            text.strip()
+        ] if text.strip() else []
 
     normalized = []
 
     for sentence in sentences:
         normalized.extend(
-            split_oversized_sentence(sentence)
+            split_oversized_sentence(
+                sentence
+            )
         )
 
     chunks = []
@@ -422,24 +451,33 @@ def split_into_chunks(text):
 
         if len(candidate) <= CHUNK_TARGET:
             current = candidate
+
         else:
             if current:
-                chunks.append(current.strip())
+                chunks.append(
+                    current.strip()
+                )
 
             current = sentence.strip()
 
     if current:
-        chunks.append(current.strip())
+        chunks.append(
+            current.strip()
+        )
 
     return chunks
 
 
 # =========================================================
-# RESPONSE STATE
+# OPENAI RESPONSE STATE
 # =========================================================
 
 def get_incomplete_reason(response):
-    if getattr(response, "status", None) != "incomplete":
+    if getattr(
+        response,
+        "status",
+        None
+    ) != "incomplete":
         return None
 
     details = getattr(
@@ -460,9 +498,14 @@ def get_incomplete_reason(response):
 
 def response_needs_continuation(response):
     return (
-        getattr(response, "status", None) == "incomplete"
-        and get_incomplete_reason(response)
-        == "max_output_tokens"
+        getattr(
+            response,
+            "status",
+            None
+        ) == "incomplete"
+        and get_incomplete_reason(
+            response
+        ) == "max_output_tokens"
     )
 
 
@@ -530,6 +573,8 @@ def alice_response(
 
 # =========================================================
 # HEALTH
+# cron-job.org обращается сюда.
+# OpenAI НЕ вызывается.
 # =========================================================
 
 @app.get("/")
@@ -623,12 +668,13 @@ def ask():
 
         wants_continue = (
             continue_by_button
-            or normalized_text in CONTINUE_WORDS
+            or normalized_text
+            in CONTINUE_WORDS
         )
 
 
         # =================================================
-        # ЛОКАЛЬНО: "ЭТО ВСЁ?"
+        # LOCAL: "ЭТО ВСЁ?"
         # =================================================
 
         if normalized_text in DONE_CHECK_WORDS:
@@ -637,10 +683,15 @@ def ask():
             )
 
             model_can_continue = (
-                state["needs_model_continuation"]
+                state[
+                    "needs_model_continuation"
+                ]
             )
 
-            if has_more or model_can_continue:
+            if (
+                has_more
+                or model_can_continue
+            ):
                 answer = (
                     "Нет, информация ещё осталась."
                 )
@@ -677,7 +728,7 @@ def ask():
 
 
         # =================================================
-        # ЛОКАЛЬНО: СПАСИБО
+        # LOCAL: THANKS
         # =================================================
 
         if normalized_text in THANKS_WORDS:
@@ -699,7 +750,7 @@ def ask():
 
 
         # =================================================
-        # 1. СНАЧАЛА ВЫДАЁМ ГОТОВЫЙ PENDING CHUNK
+        # READY PENDING CHUNK
         # =================================================
 
         if (
@@ -707,7 +758,9 @@ def ask():
             and state["pending_chunks"]
         ):
             next_chunk = (
-                state["pending_chunks"].pop(0)
+                state[
+                    "pending_chunks"
+                ].pop(0)
             )
 
             has_more = bool(
@@ -716,7 +769,9 @@ def ask():
 
             model_can_continue = (
                 not has_more
-                and state["needs_model_continuation"]
+                and state[
+                    "needs_model_continuation"
+                ]
             )
 
             print(
@@ -745,14 +800,18 @@ def ask():
 
 
         # =================================================
-        # 2. OPENAI ДОЛЖЕН ПРОДОЛЖИТЬ НЕЗАВЕРШЁННЫЙ ОТВЕТ
+        # CONTINUE INCOMPLETE OPENAI RESPONSE
         # =================================================
 
         if (
             wants_continue
             and not state["pending_chunks"]
-            and state["needs_model_continuation"]
-            and state["previous_response_id"]
+            and state[
+                "needs_model_continuation"
+            ]
+            and state[
+                "previous_response_id"
+            ]
         ):
             print(
                 "MODEL CONTINUATION REQUEST",
@@ -762,27 +821,30 @@ def ask():
             openai_started = time.time()
 
             try:
-                response = client.responses.create(
-                    model=MODEL_NAME,
+                response = (
+                    client.responses.create(
+                        model=MODEL_NAME,
 
-                    previous_response_id=(
-                        state["previous_response_id"]
-                    ),
+                        previous_response_id=(
+                            state[
+                                "previous_response_id"
+                            ]
+                        ),
 
-                    input=(
-                        "Продолжи предыдущий ответ "
-                        "с того места, где он оборвался. "
-                        "Не повторяй уже сказанное."
-                    ),
+                        input=(
+                            "Продолжи предыдущий ответ "
+                            "с того места, где он оборвался. "
+                            "Не повторяй уже сказанное."
+                        ),
 
-                    reasoning={
-                        "effort": "none"
-                    },
+                        reasoning={
+                            "effort": "none"
+                        },
 
-                    max_output_tokens=420,
+                        max_output_tokens=420,
 
-                    # Для продолжения даём чуть больше времени.
-                    timeout=5.5
+                        timeout=5.5
+                    )
                 )
 
                 full_answer = (
@@ -802,8 +864,10 @@ def ask():
                     flush=True
                 )
 
-                reason = get_incomplete_reason(
-                    response
+                reason = (
+                    get_incomplete_reason(
+                        response
+                    )
                 )
 
                 print(
@@ -812,18 +876,18 @@ def ask():
                     flush=True
                 )
 
-                state["previous_response_id"] = (
-                    getattr(
-                        response,
-                        "id",
-                        None
-                    )
+                state[
+                    "previous_response_id"
+                ] = getattr(
+                    response,
+                    "id",
+                    None
                 )
 
-                state["needs_model_continuation"] = (
-                    response_needs_continuation(
-                        response
-                    )
+                state[
+                    "needs_model_continuation"
+                ] = response_needs_continuation(
+                    response
                 )
 
             except APITimeoutError:
@@ -844,7 +908,9 @@ def ask():
                     "Попробуйте ещё раз."
                 )
 
-                state["needs_model_continuation"] = True
+                state[
+                    "needs_model_continuation"
+                ] = True
 
             except APIError as e:
                 print(
@@ -882,9 +948,9 @@ def ask():
 
             first_chunk = chunks[0]
 
-            state["pending_chunks"] = (
-                chunks[1:]
-            )
+            state[
+                "pending_chunks"
+            ] = chunks[1:]
 
             has_more = bool(
                 state["pending_chunks"]
@@ -892,7 +958,9 @@ def ask():
 
             model_can_continue = (
                 not has_more
-                and state["needs_model_continuation"]
+                and state[
+                    "needs_model_continuation"
+                ]
             )
 
             print(
@@ -921,13 +989,15 @@ def ask():
 
 
         # =================================================
-        # 3. "ПРОДОЛЖАЙ", НО ОТВЕТ УЖЕ ПОЛНЫЙ
+        # CONTINUE, BUT NOTHING LEFT
         # =================================================
 
         if (
             wants_continue
             and not state["pending_chunks"]
-            and not state["needs_model_continuation"]
+            and not state[
+                "needs_model_continuation"
+            ]
         ):
             answer = (
                 "Это был полный ответ. "
@@ -950,20 +1020,35 @@ def ask():
 
 
         # =================================================
-        # НОВЫЙ ВОПРОС
+        # NEW QUESTION
         # =================================================
 
-        if text and not wants_continue:
+        if (
+            text
+            and not wants_continue
+        ):
             if state["pending_chunks"]:
                 print(
                     "OLD PENDING CHUNKS CLEARED",
                     flush=True
                 )
 
-            state["pending_chunks"] = []
-            state["previous_response_id"] = None
-            state["needs_model_continuation"] = False
+            state[
+                "pending_chunks"
+            ] = []
 
+            state[
+                "previous_response_id"
+            ] = None
+
+            state[
+                "needs_model_continuation"
+            ] = False
+
+
+        # =================================================
+        # EMPTY INPUT
+        # =================================================
 
         if not text:
             answer = (
@@ -979,6 +1064,10 @@ def ask():
                 "answer": answer
             })
 
+
+        # =================================================
+        # QUICK LOCAL ANSWER
+        # =================================================
 
         quick = quick_answer(
             text
@@ -1025,7 +1114,9 @@ def ask():
 
 
         output_budget = (
-            choose_output_budget(text)
+            choose_output_budget(
+                text
+            )
         )
 
         print(
@@ -1034,7 +1125,8 @@ def ask():
         )
 
         print(
-            f"OUTPUT BUDGET: {output_budget}",
+            f"OUTPUT BUDGET: "
+            f"{output_budget}",
             flush=True
         )
 
@@ -1046,20 +1138,26 @@ def ask():
         openai_started = time.time()
 
         try:
-            response = client.responses.create(
-                model=MODEL_NAME,
+            response = (
+                client.responses.create(
+                    model=MODEL_NAME,
 
-                instructions=SYSTEM_PROMPT,
+                    instructions=(
+                        SYSTEM_PROMPT
+                    ),
 
-                input=conversation,
+                    input=conversation,
 
-                reasoning={
-                    "effort": "none"
-                },
+                    reasoning={
+                        "effort": "none"
+                    },
 
-                max_output_tokens=output_budget,
+                    max_output_tokens=(
+                        output_budget
+                    ),
 
-                timeout=4.2
+                    timeout=4.2
+                )
             )
 
             full_answer = (
@@ -1079,10 +1177,12 @@ def ask():
                 flush=True
             )
 
-            response_status = getattr(
-                response,
-                "status",
-                None
+            response_status = (
+                getattr(
+                    response,
+                    "status",
+                    None
+                )
             )
 
             incomplete_reason = (
@@ -1092,7 +1192,7 @@ def ask():
             )
 
             print(
-                f"RESPONSE STATUS: "
+                "RESPONSE STATUS: "
                 f"{response_status}",
                 flush=True
             )
@@ -1103,18 +1203,18 @@ def ask():
                 flush=True
             )
 
-            state["previous_response_id"] = (
-                getattr(
-                    response,
-                    "id",
-                    None
-                )
+            state[
+                "previous_response_id"
+            ] = getattr(
+                response,
+                "id",
+                None
             )
 
-            state["needs_model_continuation"] = (
-                response_needs_continuation(
-                    response
-                )
+            state[
+                "needs_model_continuation"
+            ] = response_needs_continuation(
+                response
             )
 
 
@@ -1135,8 +1235,13 @@ def ask():
                 "Повторите вопрос."
             )
 
-            state["previous_response_id"] = None
-            state["needs_model_continuation"] = False
+            state[
+                "previous_response_id"
+            ] = None
+
+            state[
+                "needs_model_continuation"
+            ] = False
 
 
         except APIError as e:
@@ -1151,8 +1256,13 @@ def ask():
                 "Повторите вопрос."
             )
 
-            state["previous_response_id"] = None
-            state["needs_model_continuation"] = False
+            state[
+                "previous_response_id"
+            ] = None
+
+            state[
+                "needs_model_continuation"
+            ] = False
 
 
         except Exception as e:
@@ -1167,8 +1277,13 @@ def ask():
                 "Повторите вопрос."
             )
 
-            state["previous_response_id"] = None
-            state["needs_model_continuation"] = False
+            state[
+                "previous_response_id"
+            ] = None
+
+            state[
+                "needs_model_continuation"
+            ] = False
 
 
         if not full_answer:
@@ -1179,7 +1294,7 @@ def ask():
 
 
         # =================================================
-        # HISTORY
+        # SAVE HISTORY
         # =================================================
 
         history.append({
@@ -1192,11 +1307,11 @@ def ask():
             "content": full_answer
         })
 
-        state["history"] = (
-            history[
-                -MAX_HISTORY_ITEMS:
-            ]
-        )
+        state[
+            "history"
+        ] = history[
+            -MAX_HISTORY_ITEMS:
+        ]
 
 
         # =================================================
@@ -1214,9 +1329,9 @@ def ask():
 
         first_chunk = chunks[0]
 
-        state["pending_chunks"] = (
-            chunks[1:]
-        )
+        state[
+            "pending_chunks"
+        ] = chunks[1:]
 
         has_more = bool(
             state["pending_chunks"]
@@ -1224,7 +1339,9 @@ def ask():
 
         model_can_continue = (
             not has_more
-            and state["needs_model_continuation"]
+            and state[
+                "needs_model_continuation"
+            ]
         )
 
         print(
@@ -1264,6 +1381,10 @@ def ask():
         })
 
 
+    # =====================================================
+    # FATAL ERROR
+    # =====================================================
+
     except Exception as e:
         print(
             "FATAL ERROR: "
@@ -1294,6 +1415,10 @@ def ask():
                 "Повторите вопрос."
         })
 
+
+# =========================================================
+# LOCAL START
+# =========================================================
 
 if __name__ == "__main__":
     port = int(
