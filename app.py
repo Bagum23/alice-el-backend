@@ -8,18 +8,18 @@ from openai import OpenAI, APITimeoutError, APIError
 
 app = Flask(__name__)
 
+MODEL_NAME = "gpt-5.6-luna"
+
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
     timeout=4.2,
     max_retries=0
 )
 
-# История диалога и очередь непроговоренных частей.
 sessions = {}
 
 MAX_HISTORY_ITEMS = 10
 
-# Оставляем хороший запас до лимита Алисы 1024 символа.
 CHUNK_TARGET = 760
 CHUNK_HARD_MAX = 900
 
@@ -50,9 +50,10 @@ backend самостоятельно разобьёт длинный текст 
 
 Пиши нормальными законченными предложениями.
 Не обрывай предложение посередине.
+
 Не используй Markdown, таблицы и сложное форматирование.
-Избегай воды и повторов.
 Не называй себя Алисой.
+Избегай воды и повторов.
 """
 
 
@@ -154,7 +155,7 @@ def choose_output_budget(text):
     )
 
     if any(x in t for x in long_markers):
-        return 500
+        return 420
 
     medium_markers = (
         "расскажи",
@@ -168,7 +169,7 @@ def choose_output_budget(text):
     )
 
     if any(x in t for x in medium_markers):
-        return 320
+        return 280
 
     short_markers = (
         "сколько",
@@ -180,15 +181,12 @@ def choose_output_budget(text):
     )
 
     if any(x in t for x in short_markers):
-        return 180
+        return 160
 
-    return 260
+    return 220
 
 
 def split_sentences(text):
-    """
-    Делит текст на предложения, сохраняя ., !, ?, …
-    """
     text = re.sub(r"\s+", " ", text).strip()
 
     if not text:
@@ -207,10 +205,6 @@ def split_sentences(text):
 
 
 def split_into_chunks(text):
-    """
-    Собирает голосовые части только по границам предложений.
-    Стараемся держаться около CHUNK_TARGET.
-    """
     sentences = split_sentences(text)
 
     if not sentences:
@@ -234,8 +228,6 @@ def split_into_chunks(text):
             chunks.append(current)
             current = ""
 
-        # Редкий случай: одно предложение само длиннее лимита.
-        # Сначала пытаемся разделить его по ; : , —
         if len(sentence) > CHUNK_HARD_MAX:
             subparts = re.split(
                 r'(?<=[;:,—])\s+',
@@ -257,8 +249,6 @@ def split_into_chunks(text):
                     if subcurrent:
                         chunks.append(subcurrent)
 
-                    # Только как самый крайний fallback:
-                    # не превышаем технический предел.
                     while len(part) > CHUNK_HARD_MAX:
                         cut = part.rfind(
                             " ",
@@ -359,10 +349,6 @@ def ask():
 
         state = get_session(session_id)
 
-        # ------------------------------------------------
-        # Есть непроговоренные части предыдущего ответа
-        # ------------------------------------------------
-
         wants_continue = (
             continue_by_button
             or text.lower().strip() in CONTINUE_WORDS
@@ -392,14 +378,8 @@ def ask():
                 "has_more": has_more
             })
 
-        # Если пользователь задал новый вопрос,
-        # старую очередь продолжений сбрасываем.
         if text and not wants_continue:
             state["pending_chunks"] = []
-
-        # ------------------------------------------------
-        # Пустой запрос
-        # ------------------------------------------------
 
         if not text:
             answer = "Привет! Я Эл. Чем могу помочь?"
@@ -410,10 +390,6 @@ def ask():
             return jsonify({
                 "answer": answer
             })
-
-        # ------------------------------------------------
-        # Быстрый локальный ответ
-        # ------------------------------------------------
 
         quick = quick_answer(text)
 
@@ -429,10 +405,6 @@ def ask():
             return jsonify({
                 "answer": quick
             })
-
-        # ------------------------------------------------
-        # История
-        # ------------------------------------------------
 
         history = state["history"][-MAX_HISTORY_ITEMS:]
 
@@ -452,23 +424,24 @@ def ask():
         output_budget = choose_output_budget(text)
 
         print(
-            f"OUTPUT BUDGET: {output_budget}",
+            f"MODEL: {MODEL_NAME}",
             flush=True
         )
 
-        # ------------------------------------------------
-        # OpenAI
-        # ------------------------------------------------
+        print(
+            f"OUTPUT BUDGET: {output_budget}",
+            flush=True
+        )
 
         openai_started = time.time()
 
         try:
             response = client.responses.create(
-                model="gpt-5.6-terra",
+                model=MODEL_NAME,
                 instructions=SYSTEM_PROMPT,
                 input=conversation,
                 reasoning={
-                    "effort": "low"
+                    "effort": "none"
                 },
                 max_output_tokens=output_budget,
                 timeout=4.2
@@ -482,6 +455,11 @@ def ask():
             print(
                 f"OPENAI TIME: "
                 f"{time.time() - openai_started:.2f}s",
+                flush=True
+            )
+
+            print(
+                f"FULL ANSWER LENGTH: {len(full_answer)}",
                 flush=True
             )
 
@@ -531,11 +509,6 @@ def ask():
                 "Повторите вопрос."
             )
 
-        # ------------------------------------------------
-        # Запоминаем ПОЛНЫЙ ответ,
-        # а не только первый голосовой кусок
-        # ------------------------------------------------
-
         history.append({
             "role": "user",
             "content": text
@@ -549,10 +522,6 @@ def ask():
         state["history"] = (
             history[-MAX_HISTORY_ITEMS:]
         )
-
-        # ------------------------------------------------
-        # Разбиваем ответ по предложениям
-        # ------------------------------------------------
 
         chunks = split_into_chunks(
             full_answer
