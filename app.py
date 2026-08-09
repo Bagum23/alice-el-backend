@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import threading
 
 from flask import Flask, request, jsonify
 from openai import OpenAI, APITimeoutError, APIError
@@ -16,6 +17,78 @@ client = OpenAI(
     max_retries=0
 )
 
+threading.Thread(
+    target=warmup_openai,
+    name="openai-warmup",
+    daemon=True
+).start()
+
+# =========================================================
+# OPENAI STARTUP WARMUP
+# =========================================================
+
+_warmup_started = False
+_warmup_lock = threading.Lock()
+
+
+def warmup_openai():
+    """
+    Один короткий запрос к OpenAI после запуска worker.
+
+    Нужен для прогрева исходящего HTTP/TLS-соединения
+    Render -> OpenAI до первого реального вопроса пользователя.
+    """
+
+    global _warmup_started
+
+    with _warmup_lock:
+        if _warmup_started:
+            return
+
+        _warmup_started = True
+
+    # Даём Gunicorn / Render спокойно закончить запуск.
+    time.sleep(3.0)
+
+    started = time.time()
+
+    try:
+        print(
+            "OPENAI WARMUP START",
+            flush=True
+        )
+
+        response = client.responses.create(
+            model=MODEL_NAME,
+            input="Ответь только: OK",
+            reasoning={
+                "effort": "none"
+            },
+            max_output_tokens=8,
+
+            # Warmup не связан с лимитом webhook Алисы,
+            # поэтому можно спокойно дать ему больше времени.
+            timeout=10.0
+        )
+
+        elapsed = time.time() - started
+
+        print(
+            f"OPENAI WARMUP OK | "
+            f"TIME: {elapsed:.2f}s | "
+            f"STATUS: {getattr(response, 'status', None)}",
+            flush=True
+        )
+
+    except Exception as e:
+        elapsed = time.time() - started
+
+        print(
+            f"OPENAI WARMUP FAILED | "
+            f"TIME: {elapsed:.2f}s | "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
 
 # =========================================================
 # CONFIG
