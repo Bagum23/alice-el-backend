@@ -3,9 +3,12 @@ import time
 import re
 import threading
 import uuid
+import json
+import urllib.request
+import urllib.error
 
 from flask import Flask, request, jsonify
-from openai import OpenAI, APITimeoutError, APIError
+from openai import OpenAI
 
 
 app = Flask(__name__)
@@ -14,23 +17,46 @@ MODEL_NAME = "gpt-5.6-luna"
 
 
 # =========================================================
-# TIMING
+# SETTINGS
 # =========================================================
 
-# Сколько максимум сам webhook ждёт OpenAI.
-# После этого Алисе отдаём локальный ответ,
-# а OpenAI продолжает работать в фоне.
 ALICE_WAIT_SECONDS = 3.2
 
-# Сам фоновый OpenAI-запрос может работать дольше.
 BACKGROUND_OPENAI_TIMEOUT = 15.0
-
-# Продолжение модели тоже запускаем в фоне.
 BACKGROUND_CONTINUATION_TIMEOUT = 15.0
+
+EMAIL_OPENAI_TIMEOUT = 30.0
+
+MAX_HISTORY_ITEMS = 10
+
+CHUNK_TARGET = 700
+CHUNK_HARD_MAX = 900
+
+CONTINUE_PROMPT = "Продолжить?"
 
 
 # =========================================================
-# OPENAI CLIENT
+# EMAIL SETTINGS
+# =========================================================
+
+USER_EMAIL = os.environ.get(
+    "USER_EMAIL",
+    ""
+).strip()
+
+RESEND_API_KEY = os.environ.get(
+    "RESEND_API_KEY",
+    ""
+).strip()
+
+RESEND_FROM_EMAIL = os.environ.get(
+    "RESEND_FROM_EMAIL",
+    "Пом Эл <onboarding@resend.dev>"
+).strip()
+
+
+# =========================================================
+# OPENAI
 # =========================================================
 
 client = OpenAI(
@@ -49,9 +75,11 @@ _warmup_lock = threading.Lock()
 
 
 def warmup_openai():
+
     global _warmup_started
 
     with _warmup_lock:
+
         if _warmup_started:
             return
 
@@ -62,6 +90,7 @@ def warmup_openai():
     started = time.time()
 
     try:
+
         print(
             "OPENAI WARMUP START",
             flush=True
@@ -85,6 +114,7 @@ def warmup_openai():
         )
 
     except Exception as e:
+
         print(
             f"OPENAI WARMUP FAILED | "
             f"TIME: {time.time() - started:.2f}s | "
@@ -101,17 +131,53 @@ threading.Thread(
 
 
 # =========================================================
-# CONFIG
+# MEMORY
 # =========================================================
 
 sessions = {}
 
-MAX_HISTORY_ITEMS = 10
 
-CHUNK_TARGET = 700
-CHUNK_HARD_MAX = 900
+def get_session(session_id):
 
-CONTINUE_PROMPT = "Продолжить?"
+    if session_id not in sessions:
+
+        sessions[session_id] = {
+
+            "history": [],
+
+            "pending_chunks": [],
+
+            "previous_response_id": None,
+
+            "needs_model_continuation": False,
+
+            "generation_running": False,
+
+            "generation_ready": False,
+
+            "generation_job_id": None,
+
+            "generation_error": None,
+
+            # Последний содержательный ответ.
+            "last_full_answer": "",
+
+            "last_user_question": "",
+
+            # Email.
+            "email_running": False,
+
+            # idle / sending / sent / error
+            "last_email_status": "idle",
+
+            "last_email_subject": "",
+
+            "last_email_error": "",
+
+            "lock": threading.Lock()
+        }
+
+    return sessions[session_id]
 
 
 # =========================================================
@@ -139,15 +205,42 @@ SYSTEM_PROMPT = """
 Анализ, прогноз, сравнение, маршрут или подробный рассказ —
 развёрнутый законченный ответ.
 
-Не пытайся обязательно вместить большой ответ в один короткий блок.
-Backend самостоятельно разбивает длинные ответы и умеет продолжать их.
+Backend самостоятельно разбивает длинные ответы
+на несколько частей и умеет продолжать их.
 
 Пиши нормальными законченными предложениями.
 Старайся делать отдельное предложение короче 300 символов.
 
 Не используй Markdown, таблицы и сложное форматирование.
 Не называй себя Алисой.
+
 Избегай воды и повторов.
+"""
+
+
+EMAIL_SYSTEM_PROMPT = """
+Ты готовишь информационный материал для отправки по электронной почте.
+
+Пиши по-русски.
+
+Материал должен быть значительно подробнее обычного голосового ответа.
+
+Структура:
+краткое введение;
+основная информация;
+важные детали;
+практические рекомендации;
+краткий итог.
+
+Используй понятные заголовки и списки там, где они полезны.
+
+Не упоминай ограничения голосового интерфейса.
+
+Не придумывай актуальные цены, расписания, новости
+или другие данные реального времени, если они не были предоставлены.
+
+Материал должен быть самостоятельным и понятным
+без предыдущего диалога.
 """
 
 
@@ -156,6 +249,7 @@ Backend самостоятельно разбивает длинные отве�
 # =========================================================
 
 CONTINUE_WORDS = {
+
     "продолжай",
     "продолжить",
     "дальше",
@@ -175,6 +269,7 @@ CONTINUE_WORDS = {
 
 
 DONE_CHECK_WORDS = {
+
     "все",
     "всё",
     "это все",
@@ -189,6 +284,7 @@ DONE_CHECK_WORDS = {
 
 
 THANKS_WORDS = {
+
     "спасибо",
     "ок спасибо",
     "хорошо спасибо",
@@ -200,12 +296,51 @@ THANKS_WORDS = {
 }
 
 
+EXIT_WORDS = {
+
+    "заканчивай",
+    "заканчивай работу",
+    "эл заканчивай",
+    "эл заканчивай работу",
+    "эл закончи работу",
+    "закончи работу",
+    "заверши работу",
+    "завершить",
+    "выход",
+    "выйти",
+    "стоп"
+}
+
+
+ALREADY_ACTIVE_WORDS = {
+
+    "активируй пом эл",
+    "активируй помощник эл",
+    "запусти пом эл",
+    "запусти помощник эл"
+}
+
+
+EMAIL_STATUS_WORDS = {
+
+    "письмо отправилось",
+    "письмо ушло",
+    "отправилось письмо",
+    "почта отправилась",
+    "что с письмом",
+    "статус письма"
+}
+
+
 # =========================================================
 # TEXT HELPERS
 # =========================================================
 
 def normalize_command(text):
-    text = (text or "").lower().strip()
+
+    text = (
+        text or ""
+    ).lower().strip()
 
     text = re.sub(
         r"[.!?,;:…]+$",
@@ -222,10 +357,123 @@ def normalize_command(text):
     return text.strip()
 
 
+# =========================================================
+# EMAIL COMMAND PARSER
+# =========================================================
+
+def parse_email_request(text):
+
+    original = (
+        text or ""
+    ).strip()
+
+    normalized = normalize_command(
+        original
+    )
+
+    # Это должна быть именно команда,
+    # а не обычный вопрос про почту.
+
+    if not re.match(
+        r"^(?:эл\s+)?"
+        r"(?:отправь|пришли|скинь|перешли)",
+        normalized
+    ):
+        return None
+
+
+    if (
+        "почт" not in normalized
+        and "email" not in normalized
+        and "емейл" not in normalized
+    ):
+        return None
+
+
+    # -----------------------------------------------------
+    # "Отправь мне это на почту"
+    # -----------------------------------------------------
+
+    last_markers = (
+        "это на почту",
+        "этот ответ на почту",
+        "последний ответ на почту",
+        "это по почте",
+        "последний ответ по почте"
+    )
+
+    if any(
+        marker in normalized
+        for marker in last_markers
+    ):
+        return {
+            "type": "last"
+        }
+
+
+    # -----------------------------------------------------
+    # "Отправь мне на почту информационный пакет по ..."
+    # -----------------------------------------------------
+
+    patterns = [
+
+        (
+            r"^(?:эл\s+)?"
+            r"(?:отправь|пришли|скинь|перешли)"
+            r"(?:\s+мне)?"
+            r"\s+(?:на\s+почту|по\s+почте)"
+            r"\s+(?:информационный\s+пакет|"
+            r"пакет|информацию|материалы?)"
+            r"\s+(?:по|о|об)\s+(.+)$"
+        ),
+
+        (
+            r"^(?:эл\s+)?"
+            r"(?:отправь|пришли|скинь|перешли)"
+            r"(?:\s+мне)?"
+            r"\s+(?:информационный\s+пакет|"
+            r"пакет|информацию|материалы?)"
+            r"\s+(?:по|о|об)\s+(.+?)"
+            r"\s+(?:на\s+почту|по\s+почте)$"
+        )
+    ]
+
+
+    for pattern in patterns:
+
+        match = re.match(
+            pattern,
+            normalized
+        )
+
+        if match:
+
+            topic = (
+                match.group(1)
+                .strip(" .!?")
+            )
+
+            if topic:
+
+                return {
+                    "type": "package",
+                    "topic": topic
+                }
+
+
+    return None
+
+
+# =========================================================
+# QUICK ANSWERS
+# =========================================================
+
 def quick_answer(text):
+
     t = normalize_command(text)
 
     greetings = {
+
         "привет",
         "здравствуй",
         "здравствуйте",
@@ -237,7 +485,12 @@ def quick_answer(text):
     }
 
     if t in greetings:
-        return "Привет! Я Эл. Чем могу помочь?"
+
+        return (
+            "Привет! Я Эл. "
+            "Чем могу помочь?"
+        )
+
 
     multiplication = re.fullmatch(
         r"\s*(-?\d+(?:[.,]\d+)?)\s*"
@@ -246,40 +499,59 @@ def quick_answer(text):
         t
     )
 
+
     if multiplication:
+
         try:
+
             a = float(
-                multiplication.group(1).replace(",", ".")
+                multiplication
+                .group(1)
+                .replace(",", ".")
             )
 
             b = float(
-                multiplication.group(2).replace(",", ".")
+                multiplication
+                .group(2)
+                .replace(",", ".")
             )
 
             result = a * b
 
             if result.is_integer():
-                result = int(result)
+
+                result = int(
+                    result
+                )
 
             return (
-                f"{multiplication.group(1)} умножить на "
-                f"{multiplication.group(2)} равно {result}."
+                f"{multiplication.group(1)} "
+                f"умножить на "
+                f"{multiplication.group(2)} "
+                f"равно {result}."
             )
 
         except Exception:
+
             pass
+
 
     return None
 
 
 # =========================================================
-# INITIAL OUTPUT BUDGET
+# OUTPUT BUDGET
 # =========================================================
 
 def choose_output_budget(text):
-    t = normalize_command(text)
+
+    t = normalize_command(
+        text
+    )
+
 
     long_markers = (
+
         "проанализируй",
         "анализ",
         "сравни",
@@ -299,10 +571,17 @@ def choose_output_budget(text):
         "как добраться"
     )
 
-    if any(marker in t for marker in long_markers):
+
+    if any(
+        marker in t
+        for marker in long_markers
+    ):
+
         return 220
 
+
     medium_markers = (
+
         "расскажи",
         "объясни",
         "почему",
@@ -313,10 +592,17 @@ def choose_output_budget(text):
         "рекомендуешь"
     )
 
-    if any(marker in t for marker in medium_markers):
+
+    if any(
+        marker in t
+        for marker in medium_markers
+    ):
+
         return 180
 
+
     short_markers = (
+
         "сколько",
         "когда",
         "кто",
@@ -325,8 +611,14 @@ def choose_output_budget(text):
         "сколько лет"
     )
 
-    if any(marker in t for marker in short_markers):
+
+    if any(
+        marker in t
+        for marker in short_markers
+    ):
+
         return 120
+
 
     return 160
 
@@ -336,128 +628,167 @@ def choose_output_budget(text):
 # =========================================================
 
 def split_sentences(text):
+
     text = re.sub(
         r"\s+",
         " ",
         text or ""
     ).strip()
 
+
     if not text:
+
         return []
 
+
     return [
+
         part.strip()
+
         for part in re.split(
             r'(?<=[.!?…])\s+',
             text
         )
+
         if part.strip()
     ]
 
 
 def split_oversized_sentence(sentence):
+
     if len(sentence) <= CHUNK_HARD_MAX:
-        return [sentence.strip()]
+
+        return [
+            sentence.strip()
+        ]
+
 
     parts = re.split(
         r'(?<=[;:,—])\s+',
         sentence
     )
 
+
     chunks = []
+
     current = ""
 
+
     for part in parts:
+
         part = part.strip()
 
+
         if not part:
+
             continue
+
 
         candidate = (
+
             part
             if not current
-            else current + " " + part
+
+            else
+            current + " " + part
         )
 
+
         if len(candidate) <= CHUNK_TARGET:
+
             current = candidate
+
             continue
 
+
         if current:
-            chunks.append(current.strip())
+
+            chunks.append(
+                current.strip()
+            )
+
 
         current = part
 
+
     if current:
-        chunks.append(current.strip())
 
-    final_chunks = []
+        chunks.append(
+            current.strip()
+        )
 
-    for chunk in chunks:
-        if len(chunk) <= CHUNK_HARD_MAX:
-            final_chunks.append(chunk)
-            continue
 
-        remaining = chunk
-
-        while len(remaining) > CHUNK_HARD_MAX:
-            cut = remaining.rfind(
-                " ",
-                0,
-                CHUNK_TARGET
-            )
-
-            if cut < 200:
-                cut = CHUNK_TARGET
-
-            final_chunks.append(
-                remaining[:cut].strip()
-            )
-
-            remaining = remaining[cut:].strip()
-
-        if remaining:
-            final_chunks.append(
-                remaining
-            )
-
-    return final_chunks
+    return chunks
 
 
 def split_into_chunks(text):
-    sentences = split_sentences(text)
+
+    sentences = split_sentences(
+        text
+    )
+
 
     if not sentences:
-        return [text.strip()] if text.strip() else []
+
+        return [
+            text.strip()
+        ] if text.strip() else []
+
 
     normalized = []
 
+
     for sentence in sentences:
+
         normalized.extend(
-            split_oversized_sentence(sentence)
+            split_oversized_sentence(
+                sentence
+            )
         )
+
 
     chunks = []
+
     current = ""
 
+
     for sentence in normalized:
+
         candidate = (
+
             sentence
             if not current
-            else current + " " + sentence
+
+            else
+            current + " " + sentence
         )
 
+
         if len(candidate) <= CHUNK_TARGET:
+
             current = candidate
 
-        else:
-            if current:
-                chunks.append(current.strip())
 
-            current = sentence.strip()
+        else:
+
+            if current:
+
+                chunks.append(
+                    current.strip()
+                )
+
+
+            current = (
+                sentence.strip()
+            )
+
 
     if current:
-        chunks.append(current.strip())
+
+        chunks.append(
+            current.strip()
+        )
+
 
     return chunks
 
@@ -467,12 +798,15 @@ def split_into_chunks(text):
 # =========================================================
 
 def get_incomplete_reason(response):
+
     if getattr(
         response,
         "status",
         None
     ) != "incomplete":
+
         return None
+
 
     details = getattr(
         response,
@@ -480,8 +814,11 @@ def get_incomplete_reason(response):
         None
     )
 
+
     if not details:
+
         return None
+
 
     return getattr(
         details,
@@ -491,42 +828,21 @@ def get_incomplete_reason(response):
 
 
 def response_needs_continuation(response):
+
     return (
+
         getattr(
             response,
             "status",
             None
         ) == "incomplete"
+
         and
+
         get_incomplete_reason(
             response
         ) == "max_output_tokens"
     )
-
-
-# =========================================================
-# SESSION
-# =========================================================
-
-def get_session(session_id):
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "history": [],
-            "pending_chunks": [],
-            "previous_response_id": None,
-            "needs_model_continuation": False,
-
-            # Фоновая генерация
-            "generation_running": False,
-            "generation_ready": False,
-            "generation_job_id": None,
-            "generation_error": None,
-
-            # Защита состояния от нескольких потоков
-            "lock": threading.Lock()
-        }
-
-    return sessions[session_id]
 
 
 # =========================================================
@@ -538,45 +854,494 @@ def alice_response(
     has_more=False,
     model_can_continue=False
 ):
-    spoken_text = text.strip()
+
+    spoken_text = (
+        text.strip()
+    )
+
 
     should_offer_continue = (
+
         has_more
         or model_can_continue
     )
 
+
     if should_offer_continue:
+
         spoken_text = (
             spoken_text.rstrip()
             + " "
             + CONTINUE_PROMPT
         )
 
+
     response = {
+
         "text": spoken_text,
+
         "tts": spoken_text,
+
         "end_session": False
     }
 
+
     if should_offer_continue:
+
         response["buttons"] = [
+
             {
                 "title": "Продолжить",
+
                 "payload": {
                     "action": "continue"
                 },
+
                 "hide": True
             }
         ]
 
+
     return jsonify({
+
         "response": response,
+
+        "version": "1.0"
+    })
+
+
+def alice_end_response(text):
+
+    return jsonify({
+
+        "response": {
+
+            "text": text,
+
+            "tts": text,
+
+            "end_session": True
+        },
+
         "version": "1.0"
     })
 
 
 # =========================================================
-# STORE FINISHED MODEL RESPONSE
+# RESEND API
+# =========================================================
+
+def resend_send_email(
+    recipient,
+    subject,
+    body
+):
+
+    if not RESEND_API_KEY:
+
+        raise RuntimeError(
+            "RESEND_API_KEY is not configured"
+        )
+
+
+    if not recipient:
+
+        raise RuntimeError(
+            "USER_EMAIL is not configured"
+        )
+
+
+    payload = {
+
+        "from": RESEND_FROM_EMAIL,
+
+        "to": [
+            recipient
+        ],
+
+        "subject": subject,
+
+        "text": body
+    }
+
+
+    data = json.dumps(
+        payload,
+        ensure_ascii=False
+    ).encode(
+        "utf-8"
+    )
+
+
+    req = urllib.request.Request(
+
+        "https://api.resend.com/emails",
+
+        data=data,
+
+        method="POST",
+
+        headers={
+
+            "Authorization":
+                f"Bearer {RESEND_API_KEY}",
+
+            "Content-Type":
+                "application/json",
+
+            # Resend требует User-Agent.
+            "User-Agent":
+                "alice-el-backend/1.0"
+        }
+    )
+
+
+    try:
+
+        with urllib.request.urlopen(
+            req,
+            timeout=15.0
+        ) as response:
+
+            raw = (
+                response.read()
+                .decode("utf-8")
+            )
+
+            return json.loads(
+                raw
+            )
+
+
+    except urllib.error.HTTPError as e:
+
+        try:
+
+            body = (
+                e.read()
+                .decode("utf-8")
+            )
+
+        except Exception:
+
+            body = str(e)
+
+
+        raise RuntimeError(
+            f"Resend HTTP {e.code}: {body}"
+        )
+
+
+# =========================================================
+# ASYNC EMAIL SENDER
+# =========================================================
+
+def send_email_background(
+    state,
+    subject,
+    body
+):
+
+    try:
+
+        print(
+            f"EMAIL SEND START | "
+            f"TO: {USER_EMAIL} | "
+            f"SUBJECT: {subject}",
+            flush=True
+        )
+
+
+        result = resend_send_email(
+
+            recipient=USER_EMAIL,
+
+            subject=subject,
+
+            body=body
+        )
+
+
+        email_id = (
+            result.get("id")
+            if isinstance(result, dict)
+            else None
+        )
+
+
+        with state["lock"]:
+
+            state[
+                "email_running"
+            ] = False
+
+            state[
+                "last_email_status"
+            ] = "sent"
+
+            state[
+                "last_email_error"
+            ] = ""
+
+
+        print(
+            f"EMAIL SENT | "
+            f"ID: {email_id}",
+            flush=True
+        )
+
+
+    except Exception as e:
+
+        with state["lock"]:
+
+            state[
+                "email_running"
+            ] = False
+
+            state[
+                "last_email_status"
+            ] = "error"
+
+            state[
+                "last_email_error"
+            ] = (
+                f"{type(e).__name__}: {e}"
+            )
+
+
+        print(
+            f"EMAIL ERROR | "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
+
+
+# =========================================================
+# BUILD INFORMATION PACKAGE + EMAIL
+# =========================================================
+
+def build_information_package(topic):
+
+    response = client.responses.create(
+
+        model=MODEL_NAME,
+
+        instructions=EMAIL_SYSTEM_PROMPT,
+
+        input=(
+            "Подготовь информационный пакет "
+            f"по теме: {topic}"
+        ),
+
+        reasoning={
+            "effort": "none"
+        },
+
+        max_output_tokens=1000,
+
+        timeout=EMAIL_OPENAI_TIMEOUT
+    )
+
+
+    text = (
+        response.output_text
+        or ""
+    ).strip()
+
+
+    # Если пакет упёрся в лимит —
+    # один раз автоматически продолжаем.
+    if response_needs_continuation(
+        response
+    ):
+
+        previous_id = getattr(
+            response,
+            "id",
+            None
+        )
+
+
+        if previous_id:
+
+            continuation = (
+                client.responses.create(
+
+                    model=MODEL_NAME,
+
+                    instructions=EMAIL_SYSTEM_PROMPT,
+
+                    previous_response_id=(
+                        previous_id
+                    ),
+
+                    input=(
+                        "Продолжи информационный пакет. "
+                        "Не повторяй уже написанное "
+                        "и обязательно закончи материал."
+                    ),
+
+                    reasoning={
+                        "effort": "none"
+                    },
+
+                    max_output_tokens=800,
+
+                    timeout=EMAIL_OPENAI_TIMEOUT
+                )
+            )
+
+
+            continuation_text = (
+                continuation.output_text
+                or ""
+            ).strip()
+
+
+            if continuation_text:
+
+                text += (
+                    "\n\n"
+                    + continuation_text
+                )
+
+
+    return text
+
+
+def build_and_send_package(
+    state,
+    topic
+):
+
+    started = time.time()
+
+
+    try:
+
+        print(
+            f"EMAIL PACKAGE START | "
+            f"TOPIC: {topic}",
+            flush=True
+        )
+
+
+        package = (
+            build_information_package(
+                topic
+            )
+        )
+
+
+        if not package:
+
+            raise RuntimeError(
+                "Empty information package"
+            )
+
+
+        safe_topic = (
+            topic.strip()
+        )
+
+
+        if len(safe_topic) > 90:
+
+            safe_topic = (
+                safe_topic[:87]
+                + "..."
+            )
+
+
+        subject = (
+            f"Пом Эл — "
+            f"информационный пакет: "
+            f"{safe_topic}"
+        )
+
+
+        result = resend_send_email(
+
+            recipient=USER_EMAIL,
+
+            subject=subject,
+
+            body=package
+        )
+
+
+        email_id = (
+
+            result.get("id")
+
+            if isinstance(
+                result,
+                dict
+            )
+
+            else None
+        )
+
+
+        with state["lock"]:
+
+            state[
+                "email_running"
+            ] = False
+
+            state[
+                "last_email_status"
+            ] = "sent"
+
+            state[
+                "last_email_subject"
+            ] = subject
+
+            state[
+                "last_email_error"
+            ] = ""
+
+
+        print(
+            f"EMAIL PACKAGE SENT | "
+            f"TIME: "
+            f"{time.time() - started:.2f}s | "
+            f"ID: {email_id}",
+            flush=True
+        )
+
+
+    except Exception as e:
+
+        with state["lock"]:
+
+            state[
+                "email_running"
+            ] = False
+
+            state[
+                "last_email_status"
+            ] = "error"
+
+            state[
+                "last_email_error"
+            ] = (
+                f"{type(e).__name__}: {e}"
+            )
+
+
+        print(
+            f"EMAIL PACKAGE ERROR | "
+            f"TIME: "
+            f"{time.time() - started:.2f}s | "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
+
+
+# =========================================================
+# STORE INITIAL MODEL RESULT
 # =========================================================
 
 def store_model_result(
@@ -586,100 +1351,135 @@ def store_model_result(
     history_before,
     response
 ):
+
     full_answer = (
         response.output_text
         or ""
     ).strip()
 
-    response_status = getattr(
-        response,
-        "status",
-        None
-    )
-
-    incomplete_reason = (
-        get_incomplete_reason(
-            response
-        )
-    )
 
     chunks = split_into_chunks(
         full_answer
     )
 
+
     if not chunks:
+
         chunks = [
             "Не удалось сформировать ответ."
         ]
 
+
     with state["lock"]:
 
-        # Если пользователь уже задал новый вопрос,
-        # старый фоновый результат игнорируем.
+        # Старый фоновый результат.
         if (
-            state["generation_job_id"]
+            state[
+                "generation_job_id"
+            ]
             != job_id
         ):
+
             print(
                 f"BACKGROUND RESULT DISCARDED | "
                 f"JOB: {job_id}",
                 flush=True
             )
+
             return
 
-        state["pending_chunks"] = chunks
 
-        state["previous_response_id"] = (
-            getattr(
-                response,
-                "id",
-                None
-            )
+        state[
+            "pending_chunks"
+        ] = chunks
+
+
+        state[
+            "previous_response_id"
+        ] = getattr(
+            response,
+            "id",
+            None
         )
+
 
         state[
             "needs_model_continuation"
-        ] = response_needs_continuation(
-            response
+        ] = (
+            response_needs_continuation(
+                response
+            )
         )
+
 
         history = list(
             history_before
         )
 
+
         history.append({
+
             "role": "user",
+
             "content": user_text
         })
 
+
         history.append({
+
             "role": "assistant",
+
             "content": full_answer
         })
 
-        state["history"] = (
-            history[
-                -MAX_HISTORY_ITEMS:
-            ]
-        )
 
-        state["generation_running"] = False
-        state["generation_ready"] = True
-        state["generation_error"] = None
+        state[
+            "history"
+        ] = history[
+            -MAX_HISTORY_ITEMS:
+        ]
+
+
+        state[
+            "last_user_question"
+        ] = user_text
+
+
+        state[
+            "last_full_answer"
+        ] = full_answer
+
+
+        state[
+            "generation_running"
+        ] = False
+
+
+        state[
+            "generation_ready"
+        ] = True
+
+
+        state[
+            "generation_error"
+        ] = None
+
 
     print(
         f"BACKGROUND READY | "
         f"JOB: {job_id} | "
         f"LENGTH: {len(full_answer)} | "
-        f"STATUS: {response_status} | "
-        f"INCOMPLETE: {incomplete_reason} | "
+        f"STATUS: "
+        f"{getattr(response, 'status', None)} | "
+        f"INCOMPLETE: "
+        f"{get_incomplete_reason(response)} | "
         f"CHUNKS: {[len(x) for x in chunks]}",
         flush=True
     )
 
 
 # =========================================================
-# INITIAL BACKGROUND GENERATION
+# BACKGROUND INITIAL GENERATION
 # =========================================================
 
 def run_background_generation(
@@ -691,9 +1491,12 @@ def run_background_generation(
     output_budget,
     finished_event
 ):
+
     started = time.time()
 
+
     try:
+
         print(
             f"BACKGROUND OPENAI START | "
             f"JOB: {job_id} | "
@@ -701,16 +1504,28 @@ def run_background_generation(
             flush=True
         )
 
+
         response = client.responses.create(
+
             model=MODEL_NAME,
+
             instructions=SYSTEM_PROMPT,
+
             input=conversation,
+
             reasoning={
                 "effort": "none"
             },
-            max_output_tokens=output_budget,
-            timeout=BACKGROUND_OPENAI_TIMEOUT
+
+            max_output_tokens=(
+                output_budget
+            ),
+
+            timeout=(
+                BACKGROUND_OPENAI_TIMEOUT
+            )
         )
+
 
         print(
             f"BACKGROUND OPENAI TIME: "
@@ -719,40 +1534,64 @@ def run_background_generation(
             flush=True
         )
 
+
         store_model_result(
+
             state=state,
+
             job_id=job_id,
+
             user_text=user_text,
+
             history_before=history_before,
+
             response=response
         )
 
+
     except Exception as e:
+
         with state["lock"]:
+
             if (
-                state["generation_job_id"]
+                state[
+                    "generation_job_id"
+                ]
                 == job_id
             ):
-                state["generation_running"] = False
-                state["generation_ready"] = False
-                state["generation_error"] = (
+
+                state[
+                    "generation_running"
+                ] = False
+
+                state[
+                    "generation_ready"
+                ] = False
+
+                state[
+                    "generation_error"
+                ] = (
                     f"{type(e).__name__}: {e}"
                 )
+
 
         print(
             f"BACKGROUND OPENAI ERROR | "
             f"JOB: {job_id} | "
-            f"TIME: {time.time() - started:.2f}s | "
+            f"TIME: "
+            f"{time.time() - started:.2f}s | "
             f"{type(e).__name__}: {e}",
             flush=True
         )
 
+
     finally:
+
         finished_event.set()
 
 
 # =========================================================
-# BACKGROUND MODEL CONTINUATION
+# BACKGROUND CONTINUATION
 # =========================================================
 
 def run_background_continuation(
@@ -761,16 +1600,21 @@ def run_background_continuation(
     previous_response_id,
     finished_event
 ):
+
     started = time.time()
 
+
     try:
+
         print(
             f"BACKGROUND CONTINUATION START | "
             f"JOB: {job_id}",
             flush=True
         )
 
+
         response = client.responses.create(
+
             model=MODEL_NAME,
 
             instructions=SYSTEM_PROMPT,
@@ -780,8 +1624,9 @@ def run_background_continuation(
             ),
 
             input=(
-                "Продолжи предыдущий ответ точно "
-                "с того места, где он оборвался. "
+                "Продолжи предыдущий ответ "
+                "точно с того места, "
+                "где он оборвался. "
                 "Не повторяй уже сказанное."
             ),
 
@@ -796,34 +1641,47 @@ def run_background_continuation(
             )
         )
 
+
         full_answer = (
             response.output_text
             or ""
         ).strip()
 
+
         chunks = split_into_chunks(
             full_answer
         )
 
+
         if not chunks:
+
             chunks = [
                 "Не удалось сформировать продолжение."
             ]
 
+
         with state["lock"]:
 
             if (
-                state["generation_job_id"]
+                state[
+                    "generation_job_id"
+                ]
                 != job_id
             ):
+
                 print(
-                    f"BACKGROUND CONTINUATION "
+                    "BACKGROUND CONTINUATION "
                     f"DISCARDED | JOB: {job_id}",
                     flush=True
                 )
+
                 return
 
-            state["pending_chunks"] = chunks
+
+            state[
+                "pending_chunks"
+            ] = chunks
+
 
             state[
                 "previous_response_id"
@@ -833,48 +1691,121 @@ def run_background_continuation(
                 None
             )
 
+
             state[
                 "needs_model_continuation"
-            ] = response_needs_continuation(
-                response
+            ] = (
+                response_needs_continuation(
+                    response
+                )
             )
 
-            state["generation_running"] = False
-            state["generation_ready"] = True
-            state["generation_error"] = None
+
+            # Добавляем продолжение к полному ответу.
+            if full_answer:
+
+                if state[
+                    "last_full_answer"
+                ]:
+
+                    state[
+                        "last_full_answer"
+                    ] += (
+                        "\n\n"
+                        + full_answer
+                    )
+
+                else:
+
+                    state[
+                        "last_full_answer"
+                    ] = full_answer
+
+
+                # И обновляем историю.
+                history = (
+                    state[
+                        "history"
+                    ]
+                )
+
+
+                if (
+                    history
+                    and history[-1].get(
+                        "role"
+                    ) == "assistant"
+                ):
+
+                    history[-1][
+                        "content"
+                    ] = state[
+                        "last_full_answer"
+                    ]
+
+
+            state[
+                "generation_running"
+            ] = False
+
+
+            state[
+                "generation_ready"
+            ] = True
+
+
+            state[
+                "generation_error"
+            ] = None
+
 
         print(
             f"BACKGROUND CONTINUATION READY | "
             f"JOB: {job_id} | "
-            f"TIME: {time.time() - started:.2f}s | "
+            f"TIME: "
+            f"{time.time() - started:.2f}s | "
             f"CHUNKS: {[len(x) for x in chunks]} | "
             f"MODEL_CONTINUE: "
             f"{response_needs_continuation(response)}",
             flush=True
         )
 
+
     except Exception as e:
 
         with state["lock"]:
+
             if (
-                state["generation_job_id"]
+                state[
+                    "generation_job_id"
+                ]
                 == job_id
             ):
-                state["generation_running"] = False
-                state["generation_ready"] = False
-                state["generation_error"] = (
+
+                state[
+                    "generation_running"
+                ] = False
+
+                state[
+                    "generation_ready"
+                ] = False
+
+                state[
+                    "generation_error"
+                ] = (
                     f"{type(e).__name__}: {e}"
                 )
 
+
         print(
-            f"BACKGROUND CONTINUATION ERROR | "
-            f"JOB: {job_id} | "
-            f"TIME: {time.time() - started:.2f}s | "
+            "BACKGROUND CONTINUATION ERROR | "
             f"{type(e).__name__}: {e}",
             flush=True
         )
 
+
     finally:
+
         finished_event.set()
 
 
@@ -884,8 +1815,11 @@ def run_background_continuation(
 
 @app.get("/")
 def health():
+
     return jsonify({
+
         "status": "ok",
+
         "service": "alice-el-backend"
     })
 
@@ -896,56 +1830,80 @@ def health():
 
 @app.post("/ask")
 def ask():
+
     started = time.time()
 
+
     try:
+
         data = request.get_json(
             silent=True
         ) or {}
 
+
         is_alice = (
-            isinstance(data, dict)
+
+            isinstance(
+                data,
+                dict
+            )
+
             and "request" in data
+
             and "session" in data
         )
 
 
         # -------------------------------------------------
-        # REQUEST PARSING
+        # PARSE ALICE
         # -------------------------------------------------
 
         if is_alice:
+
             req = data.get(
                 "request",
                 {}
             )
+
 
             session = data.get(
                 "session",
                 {}
             )
 
+
             session_id = session.get(
                 "session_id",
                 "default"
             )
 
+
             payload = req.get(
                 "payload"
             ) or {}
 
+
             text = (
+
                 req.get("command")
-                or req.get("original_utterance")
+
+                or req.get(
+                    "original_utterance"
+                )
+
                 or ""
             ).strip()
 
+
             continue_by_button = (
+
                 payload.get("action")
                 == "continue"
             )
 
+
         else:
+
             session_id = str(
                 data.get(
                     "session_id",
@@ -953,12 +1911,14 @@ def ask():
                 )
             )
 
+
             text = str(
                 data.get(
                     "text",
                     ""
                 )
             ).strip()
+
 
             continue_by_button = False
 
@@ -974,17 +1934,428 @@ def ask():
             session_id
         )
 
+
         normalized_text = (
             normalize_command(
                 text
             )
         )
 
-        wants_continue = (
-            continue_by_button
-            or normalized_text
-            in CONTINUE_WORDS
+
+        # =================================================
+        # EXIT
+        # =================================================
+
+        if normalized_text in EXIT_WORDS:
+
+            with state["lock"]:
+
+                # Инвалидируем старые фоновые ответы.
+                state[
+                    "generation_job_id"
+                ] = str(
+                    uuid.uuid4()
+                )
+
+                state[
+                    "pending_chunks"
+                ] = []
+
+                state[
+                    "needs_model_continuation"
+                ] = False
+
+
+            print(
+                "LOCAL EXIT",
+                flush=True
+            )
+
+
+            if is_alice:
+
+                return alice_end_response(
+                    "Хорошо. Завершаю работу."
+                )
+
+
+            return jsonify({
+
+                "answer":
+                    "Хорошо. Завершаю работу.",
+
+                "end_session": True
+            })
+
+
+        # =================================================
+        # ALREADY ACTIVE
+        # =================================================
+
+        if normalized_text in ALREADY_ACTIVE_WORDS:
+
+            answer = (
+                "Я уже активен."
+            )
+
+
+            if is_alice:
+
+                return alice_response(
+                    answer
+                )
+
+
+            return jsonify({
+                "answer": answer
+            })
+
+
+        # =================================================
+        # EMAIL STATUS
+        # =================================================
+
+        if normalized_text in EMAIL_STATUS_WORDS:
+
+            with state["lock"]:
+
+                status = state[
+                    "last_email_status"
+                ]
+
+                error = state[
+                    "last_email_error"
+                ]
+
+
+            if status == "sending":
+
+                answer = (
+                    "Письмо ещё готовится."
+                )
+
+
+            elif status == "sent":
+
+                answer = (
+                    "Да. Письмо отправлено."
+                )
+
+
+            elif status == "error":
+
+                answer = (
+                    "Письмо отправить не удалось."
+                )
+
+
+                print(
+                    f"LAST EMAIL ERROR: {error}",
+                    flush=True
+                )
+
+
+            else:
+
+                answer = (
+                    "В этой сессии я ещё "
+                    "ничего не отправлял."
+                )
+
+
+            if is_alice:
+
+                return alice_response(
+                    answer
+                )
+
+
+            return jsonify({
+                "answer": answer
+            })
+
+
+        # =================================================
+        # EMAIL COMMAND
+        # =================================================
+
+        email_request = (
+            parse_email_request(
+                text
+            )
         )
+
+
+        if email_request:
+
+            if not USER_EMAIL:
+
+                answer = (
+                    "Адрес электронной почты "
+                    "ещё не настроен."
+                )
+
+
+                if is_alice:
+
+                    return alice_response(
+                        answer
+                    )
+
+
+                return jsonify({
+                    "answer": answer
+                })
+
+
+            if not RESEND_API_KEY:
+
+                answer = (
+                    "Сервис отправки почты "
+                    "ещё не настроен."
+                )
+
+
+                if is_alice:
+
+                    return alice_response(
+                        answer
+                    )
+
+
+                return jsonify({
+                    "answer": answer
+                })
+
+
+            with state["lock"]:
+
+                already_sending = (
+                    state[
+                        "email_running"
+                    ]
+                )
+
+
+            if already_sending:
+
+                answer = (
+                    "Предыдущее письмо "
+                    "ещё готовится."
+                )
+
+
+                if is_alice:
+
+                    return alice_response(
+                        answer
+                    )
+
+
+                return jsonify({
+                    "answer": answer
+                })
+
+
+            # -------------------------------------------------
+            # SEND LAST ANSWER
+            # -------------------------------------------------
+
+            if (
+                email_request[
+                    "type"
+                ] == "last"
+            ):
+
+                with state["lock"]:
+
+                    last_answer = (
+                        state[
+                            "last_full_answer"
+                        ]
+                    )
+
+                    last_question = (
+                        state[
+                            "last_user_question"
+                        ]
+                    )
+
+                    incomplete = (
+                        state[
+                            "needs_model_continuation"
+                        ]
+                    )
+
+
+                if not last_answer:
+
+                    answer = (
+                        "У меня пока нет ответа, "
+                        "который можно отправить."
+                    )
+
+
+                elif incomplete:
+
+                    answer = (
+                        "Текущий ответ ещё не закончен. "
+                        "Сначала скажите «продолжай»."
+                    )
+
+
+                else:
+
+                    subject_topic = (
+                        last_question
+                        or "последний ответ"
+                    )
+
+
+                    if len(
+                        subject_topic
+                    ) > 90:
+
+                        subject_topic = (
+                            subject_topic[:87]
+                            + "..."
+                        )
+
+
+                    subject = (
+                        f"Пом Эл — "
+                        f"{subject_topic}"
+                    )
+
+
+                    with state["lock"]:
+
+                        state[
+                            "email_running"
+                        ] = True
+
+                        state[
+                            "last_email_status"
+                        ] = "sending"
+
+                        state[
+                            "last_email_subject"
+                        ] = subject
+
+                        state[
+                            "last_email_error"
+                        ] = ""
+
+
+                    threading.Thread(
+
+                        target=send_email_background,
+
+                        args=(
+                            state,
+                            subject,
+                            last_answer
+                        ),
+
+                        name="email-last-answer",
+
+                        daemon=True
+
+                    ).start()
+
+
+                    answer = (
+                        "Принял. "
+                        "Отправляю последний ответ "
+                        "на вашу почту."
+                    )
+
+
+                if is_alice:
+
+                    return alice_response(
+                        answer
+                    )
+
+
+                return jsonify({
+                    "answer": answer
+                })
+
+
+            # -------------------------------------------------
+            # BUILD INFORMATION PACKAGE
+            # -------------------------------------------------
+
+            topic = (
+                email_request[
+                    "topic"
+                ]
+            )
+
+
+            with state["lock"]:
+
+                state[
+                    "email_running"
+                ] = True
+
+                state[
+                    "last_email_status"
+                ] = "sending"
+
+                state[
+                    "last_email_subject"
+                ] = topic
+
+                state[
+                    "last_email_error"
+                ] = ""
+
+
+            threading.Thread(
+
+                target=build_and_send_package,
+
+                args=(
+                    state,
+                    topic
+                ),
+
+                name=(
+                    "email-package-"
+                    + uuid.uuid4().hex[:8]
+                ),
+
+                daemon=True
+
+            ).start()
+
+
+            answer = (
+                "Принял. "
+                "Готовлю информационный пакет "
+                "и отправляю его на вашу почту."
+            )
+
+
+            print(
+                f"EMAIL PACKAGE QUEUED | "
+                f"TOPIC: {topic}",
+                flush=True
+            )
+
+
+            if is_alice:
+
+                return alice_response(
+                    answer
+                )
+
+
+            return jsonify({
+                "answer": answer
+            })
 
 
         # =================================================
@@ -994,6 +2365,7 @@ def ask():
         if normalized_text in DONE_CHECK_WORDS:
 
             with state["lock"]:
+
                 generation_running = (
                     state[
                         "generation_running"
@@ -1012,32 +2384,42 @@ def ask():
                     ]
                 )
 
+
             if generation_running:
+
                 answer = (
                     "Ответ ещё готовится. "
-                    "Скажите «продолжай» через несколько секунд."
+                    "Скажите «продолжай» "
+                    "через несколько секунд."
                 )
+
 
             elif (
                 has_more
                 or model_can_continue
             ):
+
                 answer = (
                     "Нет, информация ещё осталась."
                 )
 
+
             else:
+
                 answer = (
                     "Да, это полный ответ "
                     "по текущему запросу."
                 )
 
+
             if is_alice:
+
                 return alice_response(
                     answer,
                     has_more=has_more,
                     model_can_continue=model_can_continue
                 )
+
 
             return jsonify({
                 "answer": answer
@@ -1045,15 +2427,17 @@ def ask():
 
 
         # =================================================
-        # LOCAL THANKS
+        # THANKS
         # =================================================
 
         if normalized_text in THANKS_WORDS:
 
             if is_alice:
+
                 return alice_response(
                     "Пожалуйста!"
                 )
+
 
             return jsonify({
                 "answer": "Пожалуйста!"
@@ -1061,12 +2445,26 @@ def ask():
 
 
         # =================================================
-        # CONTINUE WHILE BACKGROUND IS STILL RUNNING
+        # CONTINUE?
+        # =================================================
+
+        wants_continue = (
+
+            continue_by_button
+
+            or normalized_text
+            in CONTINUE_WORDS
+        )
+
+
+        # =================================================
+        # GENERATION STILL RUNNING
         # =================================================
 
         if wants_continue:
 
             with state["lock"]:
+
                 generation_running = (
                     state[
                         "generation_running"
@@ -1088,15 +2486,19 @@ def ask():
                     "ещё через несколько секунд."
                 )
 
+
                 print(
                     "BACKGROUND STILL RUNNING",
                     flush=True
                 )
 
+
                 if is_alice:
+
                     return alice_response(
                         answer
                     )
+
 
                 return jsonify({
                     "answer": answer
@@ -1110,16 +2512,13 @@ def ask():
                     "Повторите вопрос."
                 )
 
-                print(
-                    "BACKGROUND RESULT ERROR: "
-                    f"{generation_error}",
-                    flush=True
-                )
 
                 if is_alice:
+
                     return alice_response(
                         answer
                     )
+
 
                 return jsonify({
                     "answer": answer
@@ -1127,14 +2526,16 @@ def ask():
 
 
         # =================================================
-        # READY PENDING CHUNK
+        # READY CHUNK
         # =================================================
 
         if wants_continue:
 
             with state["lock"]:
 
-                if state["pending_chunks"]:
+                if state[
+                    "pending_chunks"
+                ]:
 
                     next_chunk = (
                         state[
@@ -1142,22 +2543,30 @@ def ask():
                         ].pop(0)
                     )
 
+
                     has_more = bool(
                         state[
                             "pending_chunks"
                         ]
                     )
 
+
                     model_can_continue = (
+
                         not has_more
+
                         and state[
                             "needs_model_continuation"
                         ]
                     )
 
+
                 else:
+
                     next_chunk = None
+
                     has_more = False
+
                     model_can_continue = False
 
 
@@ -1165,39 +2574,49 @@ def ask():
 
                 print(
                     "PENDING CHUNK SENT | "
-                    f"LENGTH: {len(next_chunk)} | "
+                    f"LENGTH: "
+                    f"{len(next_chunk)} | "
                     f"REMAINING: "
                     f"{len(state['pending_chunks'])}",
                     flush=True
                 )
 
+
                 if is_alice:
+
                     return alice_response(
                         next_chunk,
                         has_more=has_more,
                         model_can_continue=model_can_continue
                     )
 
+
                 return jsonify({
+
                     "answer": next_chunk,
-                    "has_more": has_more,
+
+                    "has_more":
+                        has_more,
+
                     "model_can_continue":
                         model_can_continue
                 })
 
 
         # =================================================
-        # MODEL CONTINUATION NEEDED
+        # MODEL CONTINUATION
         # =================================================
 
         if wants_continue:
 
             with state["lock"]:
-                needs_model_continuation = (
+
+                needs_continuation = (
                     state[
                         "needs_model_continuation"
                     ]
                 )
+
 
                 previous_response_id = (
                     state[
@@ -1207,7 +2626,7 @@ def ask():
 
 
             if (
-                needs_model_continuation
+                needs_continuation
                 and previous_response_id
             ):
 
@@ -1215,11 +2634,14 @@ def ask():
                     uuid.uuid4()
                 )
 
+
                 finished_event = (
                     threading.Event()
                 )
 
+
                 with state["lock"]:
+
                     state[
                         "generation_job_id"
                     ] = job_id
@@ -1238,41 +2660,51 @@ def ask():
 
 
                 thread = threading.Thread(
+
                     target=run_background_continuation,
+
                     args=(
+
                         state,
+
                         job_id,
+
                         previous_response_id,
+
                         finished_event
                     ),
+
                     name=(
-                        f"continuation-{job_id[:8]}"
+                        "continuation-"
+                        + job_id[:8]
                     ),
+
                     daemon=True
                 )
+
 
                 thread.start()
 
 
-                # Даём модели шанс ответить быстро.
                 finished_event.wait(
                     ALICE_WAIT_SECONDS
                 )
 
 
                 with state["lock"]:
-                    ready = (
-                        state[
-                            "generation_ready"
-                        ]
-                    )
+
+                    ready = state[
+                        "generation_ready"
+                    ]
 
 
                 if ready:
 
                     with state["lock"]:
 
-                        if state["pending_chunks"]:
+                        if state[
+                            "pending_chunks"
+                        ]:
 
                             first_chunk = (
                                 state[
@@ -1280,43 +2712,48 @@ def ask():
                                 ].pop(0)
                             )
 
+
                             has_more = bool(
                                 state[
                                     "pending_chunks"
                                 ]
                             )
 
+
                             model_can_continue = (
+
                                 not has_more
+
                                 and state[
                                     "needs_model_continuation"
                                 ]
                             )
 
+
                         else:
+
                             first_chunk = None
+
                             has_more = False
+
                             model_can_continue = False
 
 
                     if first_chunk:
 
                         if is_alice:
+
                             return alice_response(
                                 first_chunk,
                                 has_more=has_more,
                                 model_can_continue=model_can_continue
                             )
 
+
                         return jsonify({
                             "answer": first_chunk
                         })
 
-
-                print(
-                    "CONTINUATION DEFERRED TO BACKGROUND",
-                    flush=True
-                )
 
                 answer = (
                     "Продолжение готовится. "
@@ -1324,10 +2761,13 @@ def ask():
                     "через несколько секунд."
                 )
 
+
                 if is_alice:
+
                     return alice_response(
                         answer
                     )
+
 
                 return jsonify({
                     "answer": answer
@@ -1335,7 +2775,7 @@ def ask():
 
 
         # =================================================
-        # NOTHING LEFT TO CONTINUE
+        # NO MORE CONTENT
         # =================================================
 
         if wants_continue:
@@ -1345,15 +2785,13 @@ def ask():
                 "Можете задать следующий вопрос."
             )
 
-            print(
-                "NO MORE CONTENT",
-                flush=True
-            )
 
             if is_alice:
+
                 return alice_response(
                     answer
                 )
+
 
             return jsonify({
                 "answer": answer
@@ -1366,43 +2804,52 @@ def ask():
 
         if text:
 
-            # Новый вопрос делает старую фоновую
-            # задачу логически неактуальной.
             new_job_id = str(
                 uuid.uuid4()
             )
 
+
             with state["lock"]:
 
-                if state["pending_chunks"]:
+                if state[
+                    "pending_chunks"
+                ]:
+
                     print(
                         "OLD PENDING CHUNKS CLEARED",
                         flush=True
                     )
 
+
                 state[
                     "pending_chunks"
                 ] = []
+
 
                 state[
                     "previous_response_id"
                 ] = None
 
+
                 state[
                     "needs_model_continuation"
                 ] = False
+
 
                 state[
                     "generation_job_id"
                 ] = new_job_id
 
+
                 state[
                     "generation_running"
                 ] = False
 
+
                 state[
                     "generation_ready"
                 ] = False
+
 
                 state[
                     "generation_error"
@@ -1415,24 +2862,32 @@ def ask():
 
         if not text:
 
+            answer = (
+                "Привет! Я Эл. "
+                "Чем могу помочь?"
+            )
+
+
             if is_alice:
+
                 return alice_response(
-                    "Привет! Я Эл. Чем могу помочь?"
+                    answer
                 )
 
+
             return jsonify({
-                "answer":
-                    "Привет! Я Эл. Чем могу помочь?"
+                "answer": answer
             })
 
 
         # =================================================
-        # QUICK LOCAL RESPONSE
+        # QUICK LOCAL
         # =================================================
 
         quick = quick_answer(
             text
         )
+
 
         if quick:
 
@@ -1441,10 +2896,13 @@ def ask():
                 flush=True
             )
 
+
             if is_alice:
+
                 return alice_response(
                     quick
                 )
+
 
             return jsonify({
                 "answer": quick
@@ -1452,12 +2910,16 @@ def ask():
 
 
         # =================================================
-        # PREPARE MODEL REQUEST
+        # PREPARE OPENAI REQUEST
         # =================================================
 
         with state["lock"]:
+
             history_before = list(
-                state["history"][
+
+                state[
+                    "history"
+                ][
                     -MAX_HISTORY_ITEMS:
                 ]
             )
@@ -1465,14 +2927,23 @@ def ask():
 
         conversation = []
 
+
         for item in history_before:
+
             conversation.append({
-                "role": item["role"],
-                "content": item["content"]
+
+                "role":
+                    item["role"],
+
+                "content":
+                    item["content"]
             })
 
+
         conversation.append({
+
             "role": "user",
+
             "content": text
         })
 
@@ -1488,6 +2959,7 @@ def ask():
             uuid.uuid4()
         )
 
+
         finished_event = (
             threading.Event()
         )
@@ -1499,13 +2971,16 @@ def ask():
                 "generation_job_id"
             ] = job_id
 
+
             state[
                 "generation_running"
             ] = True
 
+
             state[
                 "generation_ready"
             ] = False
+
 
             state[
                 "generation_error"
@@ -1517,6 +2992,7 @@ def ask():
             flush=True
         )
 
+
         print(
             f"OUTPUT BUDGET: "
             f"{output_budget}",
@@ -1524,32 +3000,41 @@ def ask():
         )
 
 
-        # =================================================
-        # START BACKGROUND OPENAI
-        # =================================================
-
         thread = threading.Thread(
+
             target=run_background_generation,
+
             args=(
+
                 state,
+
                 job_id,
+
                 text,
+
                 conversation,
+
                 history_before,
+
                 output_budget,
+
                 finished_event
             ),
+
             name=(
-                f"openai-{job_id[:8]}"
+                "openai-"
+                + job_id[:8]
             ),
+
             daemon=True
         )
+
 
         thread.start()
 
 
         # =================================================
-        # WAIT ONLY FOR ALICE-SAFE WINDOW
+        # WAIT ONLY 3.2 SEC FOR ALICE
         # =================================================
 
         finished_event.wait(
@@ -1559,28 +3044,26 @@ def ask():
 
         with state["lock"]:
 
-            ready = (
-                state[
-                    "generation_ready"
-                ]
-            )
+            ready = state[
+                "generation_ready"
+            ]
 
-            error = (
-                state[
-                    "generation_error"
-                ]
-            )
+            error = state[
+                "generation_error"
+            ]
 
 
         # =================================================
-        # MODEL FINISHED WITHIN ~3.2s
+        # FAST RESULT
         # =================================================
 
         if ready:
 
             with state["lock"]:
 
-                if state["pending_chunks"]:
+                if state[
+                    "pending_chunks"
+                ]:
 
                     first_chunk = (
                         state[
@@ -1588,55 +3071,66 @@ def ask():
                         ].pop(0)
                     )
 
+
                     has_more = bool(
                         state[
                             "pending_chunks"
                         ]
                     )
 
+
                     model_can_continue = (
+
                         not has_more
+
                         and state[
                             "needs_model_continuation"
                         ]
                     )
 
+
                 else:
+
                     first_chunk = None
+
                     has_more = False
+
                     model_can_continue = False
 
 
             if first_chunk:
 
-                total_time = (
-                    time.time()
-                    - started
-                )
-
                 print(
                     f"FAST BACKGROUND RESULT | "
-                    f"TOTAL TIME: {total_time:.2f}s",
+                    f"TOTAL TIME: "
+                    f"{time.time() - started:.2f}s",
                     flush=True
                 )
 
+
                 if is_alice:
+
                     return alice_response(
                         first_chunk,
                         has_more=has_more,
                         model_can_continue=model_can_continue
                     )
 
+
                 return jsonify({
+
                     "answer": first_chunk,
-                    "has_more": has_more,
+
+                    "has_more":
+                        has_more,
+
                     "model_can_continue":
                         model_can_continue
                 })
 
 
         # =================================================
-        # BACKGROUND FAILED VERY QUICKLY
+        # FAST ERROR
         # =================================================
 
         if error:
@@ -1646,10 +3140,13 @@ def ask():
                 "Повторите вопрос."
             )
 
+
             if is_alice:
+
                 return alice_response(
                     answer
                 )
+
 
             return jsonify({
                 "answer": answer
@@ -1657,21 +3154,14 @@ def ask():
 
 
         # =================================================
-        # OPENAI IS STILL WORKING
-        #
-        # IMPORTANT:
-        # request continues in background.
+        # ALICE DEADLINE
         # =================================================
 
-        total_time = (
-            time.time()
-            - started
-        )
-
         print(
-            f"ALICE DEADLINE REACHED | "
-            f"JOB CONTINUES IN BACKGROUND | "
-            f"TOTAL TIME: {total_time:.2f}s",
+            "ALICE DEADLINE REACHED | "
+            "JOB CONTINUES IN BACKGROUND | "
+            f"TOTAL TIME: "
+            f"{time.time() - started:.2f}s",
             flush=True
         )
 
@@ -1684,47 +3174,58 @@ def ask():
 
 
         if is_alice:
+
             return alice_response(
                 answer
             )
 
 
         return jsonify({
+
             "answer": answer,
+
             "background": True
         })
 
 
     # =====================================================
-    # FATAL ERROR
+    # FATAL
     # =====================================================
 
     except Exception as e:
 
         print(
-            "FATAL ERROR: "
+            f"FATAL ERROR: "
             f"{type(e).__name__}: {e}",
             flush=True
         )
 
+
         try:
+
             data = request.get_json(
                 silent=True
             ) or {}
+
 
             if (
                 "request" in data
                 and "session" in data
             ):
+
                 return alice_response(
                     "Произошла ошибка. "
                     "Повторите вопрос."
                 )
 
+
         except Exception:
+
             pass
 
+
         return jsonify({
+
             "answer":
                 "Произошла ошибка. "
                 "Повторите вопрос."
@@ -1744,7 +3245,10 @@ if __name__ == "__main__":
         )
     )
 
+
     app.run(
+
         host="0.0.0.0",
+
         port=port
     )
