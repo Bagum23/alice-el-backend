@@ -16,27 +16,20 @@ client = OpenAI(
     max_retries=0
 )
 
-# ---------------------------------------------------------
-# ПАМЯТЬ
-# ---------------------------------------------------------
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 sessions = {}
 
 MAX_HISTORY_ITEMS = 10
 
-# Основной кусок держим существенно ниже лимита Алисы 1024.
 CHUNK_TARGET = 700
-
-# Даже одно длинное предложение стараемся не пропускать
-# дальше этого размера.
 CHUNK_HARD_MAX = 900
 
 CONTINUE_PROMPT = "Продолжить?"
 
-
-# ---------------------------------------------------------
-# SYSTEM PROMPT
-# ---------------------------------------------------------
 
 SYSTEM_PROMPT = """
 Ты голосовой помощник Эл.
@@ -52,25 +45,18 @@ SYSTEM_PROMPT = """
 "ему", "ей", "это", "там", "тот", "эта" и подобные слова,
 определи объект из предыдущих реплик.
 
-Выбирай длину ответа по смыслу вопроса.
-
-Простой факт — краткий прямой ответ.
+Простой фактический вопрос — краткий прямой ответ.
 
 Обычное объяснение — законченный ответ средней длины.
 
 Анализ, прогноз, сравнение, маршрут или подробный рассказ —
 развёрнутый законченный ответ.
 
-Не сокращай содержательную часть только из-за голосового интерфейса:
-backend самостоятельно разобьёт длинный ответ на несколько частей.
+Backend самостоятельно разобьёт длинный текст
+на несколько голосовых фрагментов.
 
 Пиши нормальными законченными предложениями.
-
-ВАЖНО:
-старайся делать каждое отдельное предложение короче 300 символов.
-Не создавай огромных предложений с множеством придаточных.
-
-Не обрывай предложение посередине.
+Старайся делать отдельное предложение короче 300 символов.
 
 Не используй Markdown, таблицы и сложное форматирование.
 Не называй себя Алисой.
@@ -78,30 +64,24 @@ backend самостоятельно разобьёт длинный ответ 
 """
 
 
-# ---------------------------------------------------------
-# КОМАНДЫ ПРОДОЛЖЕНИЯ
-# ---------------------------------------------------------
-
 CONTINUE_WORDS = {
     "продолжай",
+    "продолжить",
     "дальше",
     "еще",
     "ещё",
     "да",
-    "продолжить",
-    "рассказывай дальше",
     "давай дальше",
-    "продолжай дальше"
+    "продолжай дальше",
+    "рассказывай дальше"
 }
 
 
-def normalize_command(text):
-    """
-    Нормализуем голосовую команду:
-    'Продолжай!' -> 'продолжай'
-    '  Ещё? ' -> 'ещё'
-    """
+# =========================================================
+# TEXT HELPERS
+# =========================================================
 
+def normalize_command(text):
     text = (text or "").lower().strip()
 
     text = re.sub(
@@ -119,55 +99,7 @@ def normalize_command(text):
     return text.strip()
 
 
-# ---------------------------------------------------------
-# ОТВЕТ АЛИСЕ
-# ---------------------------------------------------------
-
-def alice_response(text, has_more=False):
-    """
-    Если имеются следующие части, обязательно:
-    1. добавляем голосом 'Продолжить?'
-    2. показываем кнопку Продолжить.
-    """
-
-    spoken_text = text.strip()
-
-    if has_more:
-        spoken_text = (
-            spoken_text.rstrip()
-            + " "
-            + CONTINUE_PROMPT
-        )
-
-    response = {
-        "text": spoken_text,
-        "tts": spoken_text,
-        "end_session": False
-    }
-
-    if has_more:
-        response["buttons"] = [
-            {
-                "title": "Продолжить",
-                "payload": {
-                    "action": "continue"
-                },
-                "hide": True
-            }
-        ]
-
-    return jsonify({
-        "response": response,
-        "version": "1.0"
-    })
-
-
-# ---------------------------------------------------------
-# БЫСТРЫЕ ЛОКАЛЬНЫЕ ОТВЕТЫ
-# ---------------------------------------------------------
-
 def quick_answer(text):
-
     t = normalize_command(text)
 
     greetings = {
@@ -192,7 +124,6 @@ def quick_answer(text):
     )
 
     if multiplication:
-
         try:
             a = float(
                 multiplication.group(1).replace(",", ".")
@@ -218,12 +149,7 @@ def quick_answer(text):
     return None
 
 
-# ---------------------------------------------------------
-# ДИНАМИЧЕСКАЯ ДЛИНА ОТВЕТА
-# ---------------------------------------------------------
-
 def choose_output_budget(text):
-
     t = normalize_command(text)
 
     long_markers = (
@@ -277,16 +203,11 @@ def choose_output_budget(text):
     return 220
 
 
-# ---------------------------------------------------------
-# РАЗБИЕНИЕ НА ПРЕДЛОЖЕНИЯ
-# ---------------------------------------------------------
+# =========================================================
+# SENTENCE CHUNKING
+# =========================================================
 
 def split_sentences(text):
-    """
-    Нормализуем пробелы и пытаемся делить строго
-    после . ! ? …
-    """
-
     text = re.sub(
         r"\s+",
         " ",
@@ -296,60 +217,17 @@ def split_sentences(text):
     if not text:
         return []
 
-    parts = re.split(
-        r'(?<=[.!?…])\s+',
-        text
-    )
+    return [
+        part.strip()
+        for part in re.split(
+            r'(?<=[.!?…])\s+',
+            text
+        )
+        if part.strip()
+    ]
 
-    result = []
-
-    for part in parts:
-
-        part = part.strip()
-
-        if not part:
-            continue
-
-        result.append(part)
-
-    return result
-
-
-def ensure_sentence_end(text):
-    """
-    Крайний fallback.
-    Если технически пришлось разрезать слишком длинную
-    конструкцию, делаем получившийся фрагмент
-    законченным для речи.
-    """
-
-    text = text.strip()
-
-    if not text:
-        return text
-
-    if text[-1] not in ".!?…":
-        text += "."
-
-    return text
-
-
-# ---------------------------------------------------------
-# ОБРАБОТКА АНОМАЛЬНО ДЛИННОГО ПРЕДЛОЖЕНИЯ
-# ---------------------------------------------------------
 
 def split_oversized_sentence(sentence):
-    """
-    В норме сюда почти не попадём, поскольку SYSTEM_PROMPT
-    просит предложения короче 300 символов.
-
-    Если модель всё-таки сделала предложение > 900 символов,
-    делим его сначала по смысловым паузам:
-    ; : — ,
-
-    Каждый получившийся речевой блок завершаем точкой.
-    """
-
     if len(sentence) <= CHUNK_HARD_MAX:
         return [sentence.strip()]
 
@@ -362,7 +240,6 @@ def split_oversized_sentence(sentence):
     current = ""
 
     for part in parts:
-
         part = part.strip()
 
         if not part:
@@ -379,23 +256,16 @@ def split_oversized_sentence(sentence):
             continue
 
         if current:
-            chunks.append(
-                ensure_sentence_end(current)
-            )
+            chunks.append(current.strip())
 
         current = part
 
     if current:
-        chunks.append(
-            ensure_sentence_end(current)
-        )
+        chunks.append(current.strip())
 
-    # Совсем крайний случай:
-    # один кусок после разделения всё ещё огромный.
     final_chunks = []
 
     for chunk in chunks:
-
         if len(chunk) <= CHUNK_HARD_MAX:
             final_chunks.append(chunk)
             continue
@@ -403,7 +273,6 @@ def split_oversized_sentence(sentence):
         remaining = chunk
 
         while len(remaining) > CHUNK_HARD_MAX:
-
             cut = remaining.rfind(
                 " ",
                 0,
@@ -413,68 +282,37 @@ def split_oversized_sentence(sentence):
             if cut < 200:
                 cut = CHUNK_TARGET
 
-            piece = remaining[:cut].strip()
-
             final_chunks.append(
-                ensure_sentence_end(piece)
+                remaining[:cut].strip()
             )
 
             remaining = remaining[cut:].strip()
 
         if remaining:
             final_chunks.append(
-                ensure_sentence_end(remaining)
+                remaining
             )
 
     return final_chunks
 
 
-# ---------------------------------------------------------
-# СОБИРАЕМ CHUNKS
-# ---------------------------------------------------------
-
 def split_into_chunks(text):
-    """
-    Главный принцип:
-
-    - никогда намеренно не разрезаем нормальное предложение;
-    - собираем несколько полных предложений до ~700 символов;
-    - если следующее предложение не помещается —
-      оно идёт в следующий chunk;
-    - только патологически длинное предложение
-      делится отдельным fallback-механизмом.
-    """
-
     sentences = split_sentences(text)
 
     if not sentences:
-        return [
-            ensure_sentence_end(text)
-        ] if text.strip() else []
+        return [text.strip()] if text.strip() else []
 
-    normalized_sentences = []
+    normalized = []
 
     for sentence in sentences:
-
-        if len(sentence) <= CHUNK_HARD_MAX:
-            normalized_sentences.append(
-                sentence.strip()
-            )
-        else:
-            normalized_sentences.extend(
-                split_oversized_sentence(sentence)
-            )
+        normalized.extend(
+            split_oversized_sentence(sentence)
+        )
 
     chunks = []
     current = ""
 
-    for sentence in normalized_sentences:
-
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
+    for sentence in normalized:
         candidate = (
             sentence
             if not current
@@ -482,66 +320,144 @@ def split_into_chunks(text):
         )
 
         if len(candidate) <= CHUNK_TARGET:
-
             current = candidate
-
         else:
-
             if current:
-                chunks.append(
-                    ensure_sentence_end(current)
-                )
+                chunks.append(current.strip())
 
-            current = sentence
+            current = sentence.strip()
 
     if current:
-        chunks.append(
-            ensure_sentence_end(current)
-        )
+        chunks.append(current.strip())
 
     return chunks
 
 
-# ---------------------------------------------------------
+# =========================================================
+# RESPONSE STATE
+# =========================================================
+
+def get_incomplete_reason(response):
+    if getattr(response, "status", None) != "incomplete":
+        return None
+
+    details = getattr(
+        response,
+        "incomplete_details",
+        None
+    )
+
+    if not details:
+        return None
+
+    return getattr(
+        details,
+        "reason",
+        None
+    )
+
+
+def response_needs_continuation(response):
+    return (
+        getattr(response, "status", None) == "incomplete"
+        and get_incomplete_reason(response)
+        == "max_output_tokens"
+    )
+
+
+# =========================================================
 # SESSION
-# ---------------------------------------------------------
+# =========================================================
 
 def get_session(session_id):
-
     if session_id not in sessions:
-
         sessions[session_id] = {
             "history": [],
-            "pending_chunks": []
+            "pending_chunks": [],
+
+            # ID последнего Responses API ответа,
+            # если он оборвался по max_output_tokens.
+            "previous_response_id": None,
+
+            # Нужно ли модели реально продолжить
+            # незавершённый ответ после исчерпания chunks.
+            "needs_model_continuation": False
         }
 
     return sessions[session_id]
 
 
-# ---------------------------------------------------------
+# =========================================================
+# ALICE RESPONSE
+# =========================================================
+
+def alice_response(
+    text,
+    has_more=False,
+    model_can_continue=False
+):
+    spoken_text = text.strip()
+
+    # Продолжение предлагаем, если:
+    # 1. есть уже готовый следующий chunk
+    # либо
+    # 2. модель сама не закончила ответ из-за token limit.
+    should_offer_continue = (
+        has_more
+        or model_can_continue
+    )
+
+    if should_offer_continue:
+        spoken_text = (
+            spoken_text.rstrip()
+            + " "
+            + CONTINUE_PROMPT
+        )
+
+    response = {
+        "text": spoken_text,
+        "tts": spoken_text,
+        "end_session": False
+    }
+
+    if should_offer_continue:
+        response["buttons"] = [
+            {
+                "title": "Продолжить",
+                "payload": {
+                    "action": "continue"
+                },
+                "hide": True
+            }
+        ]
+
+    return jsonify({
+        "response": response,
+        "version": "1.0"
+    })
+
+
+# =========================================================
 # HEALTH
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/")
 def health():
-
     return jsonify({
         "status": "ok",
         "service": "alice-el-backend"
     })
 
 
-# ---------------------------------------------------------
-# ОСНОВНОЙ WEBHOOK
-# ---------------------------------------------------------
+# =========================================================
+# MAIN WEBHOOK
+# =========================================================
 
 @app.post("/ask")
 def ask():
-
     started = time.time()
 
     try:
-
         data = request.get_json(
             silent=True
         ) or {}
@@ -552,12 +468,7 @@ def ask():
             and "session" in data
         )
 
-        # -------------------------------------------------
-        # Разбираем запрос Алисы
-        # -------------------------------------------------
-
         if is_alice:
-
             req = data.get(
                 "request",
                 {}
@@ -588,12 +499,7 @@ def ask():
                 == "continue"
             )
 
-        # -------------------------------------------------
-        # Обычный API-запрос для тестов
-        # -------------------------------------------------
-
         else:
-
             session_id = str(
                 data.get(
                     "session_id",
@@ -631,14 +537,13 @@ def ask():
 
 
         # =================================================
-        # ПРОДОЛЖЕНИЕ ИЗ ГОТОВОЙ ОЧЕРЕДИ
+        # 1. СНАЧАЛА ВЫДАЁМ ГОТОВЫЙ PENDING CHUNK
         # =================================================
 
         if (
             wants_continue
             and state["pending_chunks"]
         ):
-
             next_chunk = (
                 state["pending_chunks"].pop(0)
             )
@@ -647,58 +552,231 @@ def ask():
                 state["pending_chunks"]
             )
 
+            model_can_continue = (
+                not has_more
+                and state["needs_model_continuation"]
+            )
+
             print(
                 "PENDING CHUNK SENT | "
                 f"LENGTH: {len(next_chunk)} | "
                 f"REMAINING: "
-                f"{len(state['pending_chunks'])}",
+                f"{len(state['pending_chunks'])} | "
+                f"MODEL_CONTINUE: "
+                f"{model_can_continue}",
                 flush=True
             )
 
             if is_alice:
-
                 return alice_response(
                     next_chunk,
-                    has_more=has_more
+                    has_more=has_more,
+                    model_can_continue=model_can_continue
                 )
 
             return jsonify({
                 "answer": next_chunk,
-                "has_more": has_more
+                "has_more": has_more,
+                "model_can_continue":
+                    model_can_continue
             })
 
 
         # =================================================
-        # Новый содержательный вопрос сбрасывает старый хвост
+        # 2. PENDING CHUNKS ЗАКОНЧИЛИСЬ,
+        #    НО OPENAI САМ НЕ ЗАКОНЧИЛ ОТВЕТ
         # =================================================
 
         if (
-            text
-            and not wants_continue
+            wants_continue
+            and not state["pending_chunks"]
+            and state["needs_model_continuation"]
+            and state["previous_response_id"]
         ):
+            print(
+                "MODEL CONTINUATION REQUEST",
+                flush=True
+            )
 
-            if state["pending_chunks"]:
+            openai_started = time.time()
+
+            try:
+                response = client.responses.create(
+                    model=MODEL_NAME,
+
+                    previous_response_id=(
+                        state["previous_response_id"]
+                    ),
+
+                    input=(
+                        "Продолжи предыдущий ответ "
+                        "с того места, где он оборвался. "
+                        "Не повторяй уже сказанное."
+                    ),
+
+                    reasoning={
+                        "effort": "none"
+                    },
+
+                    max_output_tokens=420,
+
+                    timeout=4.2
+                )
+
+                full_answer = (
+                    response.output_text
+                    or ""
+                ).strip()
 
                 print(
-                    "OLD PENDING CHUNKS CLEARED",
+                    "MODEL CONTINUATION TIME: "
+                    f"{time.time() - openai_started:.2f}s",
                     flush=True
                 )
 
-            state["pending_chunks"] = []
+                print(
+                    "CONTINUATION STATUS: "
+                    f"{getattr(response, 'status', None)}",
+                    flush=True
+                )
+
+                reason = get_incomplete_reason(
+                    response
+                )
+
+                print(
+                    "CONTINUATION INCOMPLETE REASON: "
+                    f"{reason}",
+                    flush=True
+                )
+
+                state["previous_response_id"] = (
+                    getattr(
+                        response,
+                        "id",
+                        None
+                    )
+                )
+
+                state["needs_model_continuation"] = (
+                    response_needs_continuation(
+                        response
+                    )
+                )
+
+            except APITimeoutError:
+                print(
+                    "MODEL CONTINUATION TIMEOUT",
+                    flush=True
+                )
+
+                full_answer = (
+                    "Продолжение формируется "
+                    "дольше обычного. "
+                    "Попробуйте ещё раз."
+                )
+
+                # Не сбрасываем флаг:
+                # следующая попытка "продолжай"
+                # сможет повторить continuation.
+                state["needs_model_continuation"] = True
+
+            except APIError as e:
+                print(
+                    "MODEL CONTINUATION API ERROR: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True
+                )
+
+                full_answer = (
+                    "Не удалось получить продолжение. "
+                    "Попробуйте ещё раз."
+                )
+
+            except Exception as e:
+                print(
+                    "MODEL CONTINUATION ERROR: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True
+                )
+
+                full_answer = (
+                    "Не удалось получить продолжение. "
+                    "Попробуйте ещё раз."
+                )
 
 
-        # =================================================
-        # ПУСТОЙ ЗАПРОС
-        # =================================================
+            chunks = split_into_chunks(
+                full_answer
+            )
 
-        if not text:
+            if not chunks:
+                chunks = [
+                    "Не удалось сформировать продолжение."
+                ]
 
-            answer = (
-                "Привет! Я Эл. Чем могу помочь?"
+            first_chunk = chunks[0]
+
+            state["pending_chunks"] = (
+                chunks[1:]
+            )
+
+            has_more = bool(
+                state["pending_chunks"]
+            )
+
+            model_can_continue = (
+                not has_more
+                and state["needs_model_continuation"]
+            )
+
+            print(
+                "CONTINUATION CHUNKS: "
+                f"{len(chunks)} | "
+                f"LENGTHS: "
+                f"{[len(x) for x in chunks]} | "
+                f"MODEL_CONTINUE: "
+                f"{state['needs_model_continuation']}",
+                flush=True
             )
 
             if is_alice:
+                return alice_response(
+                    first_chunk,
+                    has_more=has_more,
+                    model_can_continue=model_can_continue
+                )
 
+            return jsonify({
+                "answer": first_chunk,
+                "has_more": has_more,
+                "model_can_continue":
+                    model_can_continue
+            })
+
+
+        # =================================================
+        # 3. ЕСЛИ ОТВЕТ УЖЕ БЫЛ ПОЛНОСТЬЮ ЗАКОНЧЕН,
+        #    "ПРОДОЛЖАЙ" НЕ ДОЛЖНО ПОРОЖДАТЬ
+        #    БЕСКОНЕЧНЫЙ НОВЫЙ ТЕКСТ
+        # =================================================
+
+        if (
+            wants_continue
+            and not state["pending_chunks"]
+            and not state["needs_model_continuation"]
+        ):
+            answer = (
+                "Это был полный ответ. "
+                "Можете задать следующий вопрос."
+            )
+
+            print(
+                "NO MORE CONTENT",
+                flush=True
+            )
+
+            if is_alice:
                 return alice_response(
                     answer
                 )
@@ -709,22 +787,47 @@ def ask():
 
 
         # =================================================
-        # ЛОКАЛЬНЫЙ ОТВЕТ
+        # НОВЫЙ ВОПРОС
         # =================================================
+
+        if text and not wants_continue:
+            if state["pending_chunks"]:
+                print(
+                    "OLD PENDING CHUNKS CLEARED",
+                    flush=True
+                )
+
+            state["pending_chunks"] = []
+            state["previous_response_id"] = None
+            state["needs_model_continuation"] = False
+
+
+        if not text:
+            answer = (
+                "Привет! Я Эл. Чем могу помочь?"
+            )
+
+            if is_alice:
+                return alice_response(
+                    answer
+                )
+
+            return jsonify({
+                "answer": answer
+            })
+
 
         quick = quick_answer(
             text
         )
 
         if quick:
-
             print(
                 "LOCAL ANSWER",
                 flush=True
             )
 
             if is_alice:
-
                 return alice_response(
                     quick
                 )
@@ -735,7 +838,7 @@ def ask():
 
 
         # =================================================
-        # ИСТОРИЯ
+        # HISTORY
         # =================================================
 
         history = (
@@ -747,7 +850,6 @@ def ask():
         conversation = []
 
         for item in history:
-
             conversation.append({
                 "role": item["role"],
                 "content": item["content"]
@@ -759,10 +861,6 @@ def ask():
         })
 
 
-        # =================================================
-        # ПАРАМЕТРЫ OPENAI
-        # =================================================
-
         output_budget = (
             choose_output_budget(text)
         )
@@ -773,33 +871,32 @@ def ask():
         )
 
         print(
-            f"OUTPUT BUDGET: "
-            f"{output_budget}",
+            f"OUTPUT BUDGET: {output_budget}",
             flush=True
         )
 
 
         # =================================================
-        # OPENAI
+        # INITIAL OPENAI CALL
         # =================================================
 
         openai_started = time.time()
 
         try:
+            response = client.responses.create(
+                model=MODEL_NAME,
 
-            response = (
-                client.responses.create(
-                    model=MODEL_NAME,
-                    instructions=SYSTEM_PROMPT,
-                    input=conversation,
-                    reasoning={
-                        "effort": "none"
-                    },
-                    max_output_tokens=(
-                        output_budget
-                    ),
-                    timeout=4.2
-                )
+                instructions=SYSTEM_PROMPT,
+
+                input=conversation,
+
+                reasoning={
+                    "effort": "none"
+                },
+
+                max_output_tokens=output_budget,
+
+                timeout=4.2
             )
 
             full_answer = (
@@ -807,14 +904,9 @@ def ask():
                 or ""
             ).strip()
 
-            openai_time = (
-                time.time()
-                - openai_started
-            )
-
             print(
-                f"OPENAI TIME: "
-                f"{openai_time:.2f}s",
+                "OPENAI TIME: "
+                f"{time.time() - openai_started:.2f}s",
                 flush=True
             )
 
@@ -824,9 +916,46 @@ def ask():
                 flush=True
             )
 
+            response_status = getattr(
+                response,
+                "status",
+                None
+            )
+
+            incomplete_reason = (
+                get_incomplete_reason(
+                    response
+                )
+            )
+
+            print(
+                f"RESPONSE STATUS: "
+                f"{response_status}",
+                flush=True
+            )
+
+            print(
+                "INCOMPLETE REASON: "
+                f"{incomplete_reason}",
+                flush=True
+            )
+
+            state["previous_response_id"] = (
+                getattr(
+                    response,
+                    "id",
+                    None
+                )
+            )
+
+            state["needs_model_continuation"] = (
+                response_needs_continuation(
+                    response
+                )
+            )
+
 
         except APITimeoutError:
-
             elapsed = (
                 time.time()
                 - openai_started
@@ -843,9 +972,11 @@ def ask():
                 "Повторите вопрос."
             )
 
+            state["previous_response_id"] = None
+            state["needs_model_continuation"] = False
+
 
         except APIError as e:
-
             print(
                 "OPENAI API ERROR: "
                 f"{type(e).__name__}: {e}",
@@ -857,9 +988,11 @@ def ask():
                 "Повторите вопрос."
             )
 
+            state["previous_response_id"] = None
+            state["needs_model_continuation"] = False
+
 
         except Exception as e:
-
             print(
                 "OPENAI ERROR: "
                 f"{type(e).__name__}: {e}",
@@ -871,9 +1004,11 @@ def ask():
                 "Повторите вопрос."
             )
 
+            state["previous_response_id"] = None
+            state["needs_model_continuation"] = False
+
 
         if not full_answer:
-
             full_answer = (
                 "Не удалось сформировать ответ. "
                 "Повторите вопрос."
@@ -881,7 +1016,7 @@ def ask():
 
 
         # =================================================
-        # СОХРАНЯЕМ ПОЛНЫЙ ОТВЕТ В КОНТЕКСТ
+        # HISTORY
         # =================================================
 
         history.append({
@@ -902,7 +1037,7 @@ def ask():
 
 
         # =================================================
-        # РЕЖЕМ ПОЛНЫЙ ОТВЕТ НА ЗАКОНЧЕННЫЕ ФРАГМЕНТЫ
+        # CHUNKING
         # =================================================
 
         chunks = split_into_chunks(
@@ -910,7 +1045,6 @@ def ask():
         )
 
         if not chunks:
-
             chunks = [
                 "Не удалось сформировать ответ."
             ]
@@ -926,38 +1060,22 @@ def ask():
             state["pending_chunks"]
         )
 
-
-        chunk_lengths = [
-            len(chunk)
-            for chunk in chunks
-        ]
-
-        print(
-            f"CHUNKS: {len(chunks)} | "
-            f"LENGTHS: {chunk_lengths} | "
-            f"REMAINING: "
-            f"{len(state['pending_chunks'])}",
-            flush=True
+        model_can_continue = (
+            not has_more
+            and state["needs_model_continuation"]
         )
 
 
-        # Дополнительная проверка для логов
-        for index, chunk in enumerate(
-            chunks,
-            start=1
-        ):
-
-            ending = (
-                chunk[-1]
-                if chunk
-                else ""
-            )
-
-            print(
-                f"CHUNK {index} END: "
-                f"{repr(ending)}",
-                flush=True
-            )
+        print(
+            f"CHUNKS: {len(chunks)} | "
+            f"LENGTHS: "
+            f"{[len(chunk) for chunk in chunks]} | "
+            f"REMAINING: "
+            f"{len(state['pending_chunks'])} | "
+            f"MODEL_CONTINUE: "
+            f"{state['needs_model_continuation']}",
+            flush=True
+        )
 
 
         total_time = (
@@ -972,32 +1090,23 @@ def ask():
         )
 
 
-        # =================================================
-        # ОТВЕТ
-        # =================================================
-
         if is_alice:
-
             return alice_response(
                 first_chunk,
-                has_more=has_more
+                has_more=has_more,
+                model_can_continue=model_can_continue
             )
+
 
         return jsonify({
             "answer": first_chunk,
             "has_more": has_more,
-            "remaining_chunks": len(
-                state["pending_chunks"]
-            )
+            "model_can_continue":
+                model_can_continue
         })
 
 
-    # =====================================================
-    # FATAL
-    # =====================================================
-
     except Exception as e:
-
         print(
             "FATAL ERROR: "
             f"{type(e).__name__}: {e}",
@@ -1005,7 +1114,6 @@ def ask():
         )
 
         try:
-
             data = request.get_json(
                 silent=True
             ) or {}
@@ -1014,7 +1122,6 @@ def ask():
                 "request" in data
                 and "session" in data
             ):
-
                 return alice_response(
                     "Произошла ошибка. "
                     "Повторите вопрос."
@@ -1030,12 +1137,7 @@ def ask():
         })
 
 
-# ---------------------------------------------------------
-# START
-# ---------------------------------------------------------
-
 if __name__ == "__main__":
-
     port = int(
         os.environ.get(
             "PORT",
