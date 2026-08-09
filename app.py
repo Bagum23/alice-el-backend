@@ -67,6 +67,80 @@ client = OpenAI(
 
 
 # =========================================================
+# OPENAI USAGE / COST LOGGING
+# =========================================================
+
+# Standard processing prices for gpt-5.6-luna, USD per 1M tokens.
+# Update these constants if OpenAI pricing changes.
+LUNA_INPUT_PRICE_PER_M = 0.20
+LUNA_CACHED_INPUT_PRICE_PER_M = 0.02
+LUNA_OUTPUT_PRICE_PER_M = 1.20
+
+
+def extract_usage(response):
+    usage = getattr(response, "usage", None)
+
+    if not usage:
+        return {
+            "input": 0,
+            "cached_input": 0,
+            "output": 0,
+            "total": 0,
+            "cost": 0.0
+        }
+
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    total_tokens = int(
+        getattr(usage, "total_tokens", input_tokens + output_tokens)
+        or (input_tokens + output_tokens)
+    )
+
+    cached_input_tokens = 0
+    input_details = getattr(usage, "input_tokens_details", None)
+
+    if input_details:
+        cached_input_tokens = int(
+            getattr(input_details, "cached_tokens", 0) or 0
+        )
+
+    uncached_input_tokens = max(
+        input_tokens - cached_input_tokens,
+        0
+    )
+
+    cost = (
+        uncached_input_tokens * LUNA_INPUT_PRICE_PER_M
+        + cached_input_tokens * LUNA_CACHED_INPUT_PRICE_PER_M
+        + output_tokens * LUNA_OUTPUT_PRICE_PER_M
+    ) / 1_000_000
+
+    return {
+        "input": input_tokens,
+        "cached_input": cached_input_tokens,
+        "output": output_tokens,
+        "total": total_tokens,
+        "cost": cost
+    }
+
+
+def log_usage(response, label="USAGE"):
+    u = extract_usage(response)
+
+    print(
+        f"{label} | "
+        f"INPUT: {u['input']} | "
+        f"CACHED: {u['cached_input']} | "
+        f"OUTPUT: {u['output']} | "
+        f"TOTAL: {u['total']} | "
+        f"COST: ${u['cost']:.6f}",
+        flush=True
+    )
+
+    return u
+
+
+# =========================================================
 # STARTUP WARMUP
 # =========================================================
 
@@ -105,6 +179,8 @@ def warmup_openai():
             max_output_tokens=16,
             timeout=10.0
         )
+
+        log_usage(response, "WARMUP USAGE")
 
         print(
             f"OPENAI WARMUP OK | "
@@ -304,6 +380,7 @@ EXIT_WORDS = {
     "эл заканчивай работу",
     "эл закончи работу",
     "закончи работу",
+    "закончить работу",
     "заверши работу",
     "завершить",
     "выход",
@@ -399,7 +476,10 @@ def parse_email_request(text):
         "этот ответ на почту",
         "последний ответ на почту",
         "это по почте",
-        "последний ответ по почте"
+        "последний ответ по почте",
+        "на почту информацию",
+        "на почту информацию",
+        "по почте информацию"
     )
 
     if any(
@@ -1124,6 +1204,13 @@ def send_email_background(
 def build_information_package(topic):
 
     full_text = ""
+    total_usage = {
+        "input": 0,
+        "cached_input": 0,
+        "output": 0,
+        "total": 0,
+        "cost": 0.0
+    }
 
     response = client.responses.create(
 
@@ -1148,33 +1235,33 @@ def build_information_package(topic):
         timeout=EMAIL_OPENAI_TIMEOUT
     )
 
+    part_number = 1
 
     part = (
         response.output_text
         or ""
     ).strip()
 
-
     if part:
         full_text += part
 
+    u = log_usage(
+        response,
+        f"EMAIL PACKAGE USAGE | PART: {part_number}"
+    )
+
+    for key in total_usage:
+        total_usage[key] += u[key]
 
     print(
-        f"EMAIL PACKAGE PART 1 | "
+        f"EMAIL PACKAGE PART {part_number} | "
         f"STATUS: {getattr(response, 'status', None)} | "
         f"REASON: {get_incomplete_reason(response)} | "
         f"LENGTH: {len(part)}",
         flush=True
     )
 
-
-    # -----------------------------------------------------
-    # Продолжаем автоматически, пока модель не завершит пакет
-    # -----------------------------------------------------
-
     max_parts = 6
-    part_number = 1
-
 
     while (
         response_needs_continuation(response)
@@ -1187,13 +1274,10 @@ def build_information_package(topic):
             None
         )
 
-
         if not previous_id:
             break
 
-
         part_number += 1
-
 
         response = client.responses.create(
 
@@ -1221,20 +1305,24 @@ def build_information_package(topic):
             timeout=EMAIL_OPENAI_TIMEOUT
         )
 
-
         part = (
             response.output_text
             or ""
         ).strip()
 
-
         if part:
-
             if full_text:
                 full_text += "\n\n"
 
             full_text += part
 
+        u = log_usage(
+            response,
+            f"EMAIL PACKAGE USAGE | PART: {part_number}"
+        )
+
+        for key in total_usage:
+            total_usage[key] += u[key]
 
         print(
             f"EMAIL PACKAGE PART {part_number} | "
@@ -1244,17 +1332,10 @@ def build_information_package(topic):
             flush=True
         )
 
-
-    # -----------------------------------------------------
-    # Защита от оборванной последней фразы
-    # -----------------------------------------------------
-
     if full_text:
-
         stripped = full_text.rstrip()
 
         if stripped[-1:] not in ".!?…":
-
             last_sentence_end = max(
                 stripped.rfind("."),
                 stripped.rfind("!"),
@@ -1263,10 +1344,17 @@ def build_information_package(topic):
             )
 
             if last_sentence_end > 0:
-                full_text = stripped[
-                    :last_sentence_end + 1
-                ]
+                full_text = stripped[:last_sentence_end + 1]
 
+    print(
+        f"EMAIL PACKAGE TOTAL USAGE | "
+        f"INPUT: {total_usage['input']} | "
+        f"CACHED: {total_usage['cached_input']} | "
+        f"OUTPUT: {total_usage['output']} | "
+        f"TOTAL: {total_usage['total']} | "
+        f"COST: ${total_usage['cost']:.6f}",
+        flush=True
+    )
 
     print(
         f"EMAIL PACKAGE COMPLETE | "
@@ -1277,9 +1365,7 @@ def build_information_package(topic):
         flush=True
     )
 
-
     return full_text
-
 
 def build_and_send_package(
     state,
@@ -1598,6 +1684,8 @@ def run_background_generation(
         )
 
 
+        log_usage(response)
+
         print(
             f"BACKGROUND OPENAI TIME: "
             f"{time.time() - started:.2f}s | "
@@ -1712,6 +1800,8 @@ def run_background_continuation(
             )
         )
 
+
+        log_usage(response, "CONTINUATION USAGE")
 
         full_answer = (
             response.output_text
@@ -2011,6 +2101,37 @@ def ask():
                 text
             )
         )
+
+
+        # =================================================
+        # STRIP REDUNDANT ALICE/SKILL WRAPPER INSIDE ACTIVE SKILL
+        # =================================================
+
+        wrapper_patterns = (
+            r"^спроси у помощника элла\s+",
+            r"^спроси у помощника эл\s+",
+            r"^спроси у пом эл\s+",
+            r"^попроси помощника элла\s+",
+            r"^попроси помощника эл\s+"
+        )
+
+        for pattern in wrapper_patterns:
+            cleaned = re.sub(
+                pattern,
+                "",
+                normalized_text,
+                count=1
+            ).strip()
+
+            if cleaned != normalized_text:
+                print(
+                    f"WRAPPER STRIPPED | BEFORE: {text} | AFTER: {cleaned}",
+                    flush=True
+                )
+
+                text = cleaned
+                normalized_text = cleaned
+                break
 
 
         # =================================================
