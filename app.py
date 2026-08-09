@@ -10,11 +10,10 @@ app = Flask(__name__)
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    timeout=4.5,
+    timeout=5.5,
     max_retries=0
 )
 
-# Память диалога по session_id Алисы
 sessions = {}
 
 
@@ -22,45 +21,35 @@ SYSTEM_PROMPT = """
 Ты голосовой помощник Эл.
 
 Ты работаешь внутри голосового интерфейса Алисы,
-но ответы пользователю формируешь ты.
+но ответы формируешь самостоятельно через OpenAI.
 
-Отвечай по-русски, естественно, точно и по существу.
+Отвечай по-русски естественно, точно и по существу.
 
-Выбирай длину ответа по смыслу вопроса.
-
-На простой фактический вопрос отвечай коротко и прямо,
-обычно одним-двумя предложениями.
-
-На вопросы, требующие объяснения, давай законченный ответ
-с достаточным количеством деталей.
-
-Если пользователь просит анализ, прогноз, сравнение,
-развёрнутое объяснение, историю или подробный рассказ,
-отвечай подробнее, обычно до 150-250 слов.
-
-Не сокращай ответ настолько, чтобы пользователю приходилось
-просить "продолжай" для получения основной информации.
-
-Если пользователь говорит:
-"короче" — сократи следующий ответ;
-"подробнее" — дай больше деталей;
-"объясни проще" — объясни простыми словами;
-"продолжай" — продолжи предыдущую мысль без повторения начала.
-
-Всегда учитывай предыдущие реплики диалога.
+Всегда учитывай предыдущий контекст разговора.
 
 Если пользователь говорит "он", "она", "у него", "у неё",
-"это", "там", "тот", "эта", "ему", "ей" и подобные слова,
-определи, к чему они относятся из предыдущего контекста.
+"ему", "ей", "там", "это", "тот", "эта" и подобные слова,
+определи, к чему они относятся из предыдущих реплик.
 
-Не задавай уточняющий вопрос, если смысл очевиден
-из предыдущих реплик.
+Не задавай уточняющий вопрос, если смысл очевиден из контекста.
+
+Выбирай длину ответа по смыслу:
+- простой факт — короткий прямой ответ;
+- обычное объяснение — законченный ответ средней длины;
+- анализ, прогноз, сравнение, подробный рассказ — более развёрнутый ответ.
+
+Не сокращай основной ответ настолько, чтобы пользователю
+приходилось говорить "продолжай", чтобы получить суть.
+
+Если пользователь говорит "продолжай" — продолжай предыдущую
+мысль без повторения начала.
+Если говорит "подробнее" — добавь существенные детали.
+Если говорит "короче" — дай краткое резюме.
+Если говорит "объясни проще" — переформулируй простыми словами.
 
 Не используй Markdown, таблицы и служебные пояснения.
-
-Не говори, что ты Алиса.
-
-Избегай лишней воды и повторов.
+Не называй себя Алисой.
+Избегай воды и повторов.
 """
 
 
@@ -76,11 +65,6 @@ def alice_response(text, end_session=False):
 
 
 def quick_answer(text):
-    """
-    Мгновенные локальные ответы.
-    OpenAI для них не вызывается.
-    """
-
     t = text.lower().strip()
 
     greetings = {
@@ -117,11 +101,79 @@ def quick_answer(text):
                 f"{multiplication.group(1)} умножить на "
                 f"{multiplication.group(2)} равно {result}."
             )
-
         except Exception:
             pass
 
     return None
+
+
+def choose_output_budget(text):
+    """
+    Определяем необходимую длину ответа.
+    Возвращаем max_output_tokens.
+    """
+
+    t = text.lower().strip()
+
+    # Явно развёрнутые запросы
+    long_markers = (
+        "проанализируй",
+        "анализ",
+        "сравни",
+        "сравнение",
+        "прогноз",
+        "спрогнозируй",
+        "расскажи подробно",
+        "расскажи подробнее",
+        "объясни подробно",
+        "подробно",
+        "история",
+        "перечисли основные",
+        "что можешь сказать",
+        "какая осень",
+        "какой прогноз",
+        "за последние",
+        "плюсы и минусы"
+    )
+
+    if any(marker in t for marker in long_markers):
+        return 420
+
+    # Команды продолжения/расширения
+    medium_long_markers = (
+        "продолжай",
+        "подробнее",
+        "расскажи",
+        "объясни",
+        "почему",
+        "как лучше",
+        "что делать",
+        "чем знаменит",
+        "в какое время",
+        "какие бывают"
+    )
+
+    if any(marker in t for marker in medium_long_markers):
+        return 280
+
+    # Короткий фактический вопрос
+    short_markers = (
+        "сколько",
+        "когда",
+        "кто",
+        "где",
+        "какая столица",
+        "какой год",
+        "сколько лет",
+        "сколько ног",
+        "сколько глаз"
+    )
+
+    if any(marker in t for marker in short_markers):
+        return 140
+
+    # Обычный вопрос
+    return 220
 
 
 @app.get("/")
@@ -155,61 +207,36 @@ def ask():
                 or ""
             ).strip()
 
-            session_id = session.get(
-                "session_id",
-                "default"
-            )
+            session_id = session.get("session_id", "default")
 
         else:
-            text = str(
-                data.get("text", "")
-            ).strip()
-
-            session_id = str(
-                data.get("session_id", "default")
-            )
+            text = str(data.get("text", "")).strip()
+            session_id = str(data.get("session_id", "default"))
 
         print(
             f"SESSION: {session_id} | INPUT: {text}",
             flush=True
         )
 
-        # Пустой запрос
         if not text:
             answer = "Привет! Я Эл. Чем могу помочь?"
 
             if is_alice:
                 return alice_response(answer)
 
-            return jsonify({
-                "answer": answer
-            })
+            return jsonify({"answer": answer})
 
-        # Быстрый локальный ответ
         answer = quick_answer(text)
 
         if answer:
-            print(
-                "LOCAL ANSWER",
-                flush=True
-            )
+            print("LOCAL ANSWER", flush=True)
 
             if is_alice:
                 return alice_response(answer)
 
-            return jsonify({
-                "answer": answer
-            })
+            return jsonify({"answer": answer})
 
-        # История текущей сессии
-        history = sessions.get(
-            session_id,
-            []
-        )
-
-        # Держим несколько последних реплик.
-        # Этого достаточно для нормального контекста
-        # и не слишком раздувает запрос.
+        history = sessions.get(session_id, [])
         history = history[-8:]
 
         conversation = []
@@ -225,24 +252,28 @@ def ask():
             "content": text
         })
 
+        output_budget = choose_output_budget(text)
+
+        print(
+            f"OUTPUT BUDGET: {output_budget}",
+            flush=True
+        )
+
         openai_started = time.time()
 
         try:
             response = client.responses.create(
-                model="gpt-5.5",
+                model="gpt-5.6-terra",
                 instructions=SYSTEM_PROMPT,
                 input=conversation,
                 reasoning={
                     "effort": "low"
                 },
-                max_output_tokens=400,
-                timeout=4.5
+                max_output_tokens=output_budget,
+                timeout=5.5
             )
 
-            answer = (
-                response.output_text
-                or ""
-            ).strip()
+            answer = (response.output_text or "").strip()
 
             print(
                 f"OPENAI TIME: "
@@ -251,14 +282,15 @@ def ask():
             )
 
         except APITimeoutError:
+            elapsed = time.time() - openai_started
+
             print(
-                f"OPENAI TIMEOUT after "
-                f"{time.time() - openai_started:.2f}s",
+                f"OPENAI TIMEOUT after {elapsed:.2f}s",
                 flush=True
             )
 
             answer = (
-                "Ответ занял слишком много времени. "
+                "Ответ формируется дольше обычного. "
                 "Повторите вопрос."
             )
 
@@ -292,7 +324,6 @@ def ask():
                 "Повторите вопрос."
             )
 
-        # Сохраняем только сам разговор
         history.append({
             "role": "user",
             "content": text
@@ -327,14 +358,9 @@ def ask():
         )
 
         try:
-            data = request.get_json(
-                silent=True
-            ) or {}
+            data = request.get_json(silent=True) or {}
 
-            if (
-                "request" in data
-                and "session" in data
-            ):
+            if "request" in data and "session" in data:
                 return alice_response(
                     "Произошла ошибка. Повторите вопрос."
                 )
@@ -348,12 +374,7 @@ def ask():
 
 
 if __name__ == "__main__":
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
+    port = int(os.environ.get("PORT", 10000))
 
     app.run(
         host="0.0.0.0",
