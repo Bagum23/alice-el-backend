@@ -8,17 +8,15 @@ from openai import OpenAI, APITimeoutError, APIError
 
 app = Flask(__name__)
 
-# Для Алисы критична скорость.
-# Отключаем автоматические повторные запросы OpenAI.
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
     timeout=4.5,
     max_retries=0
 )
 
-# Небольшая память диалога.
-# Ключ = session_id Алисы.
+# Память диалога по session_id Алисы
 sessions = {}
+
 
 SYSTEM_PROMPT = """
 Ты голосовой помощник Эл.
@@ -28,22 +26,45 @@ SYSTEM_PROMPT = """
 
 Отвечай по-русски, естественно, точно и по существу.
 
-Обычно отвечай одним-двумя короткими предложениями.
-Для простого вопроса старайся уложиться примерно в 35 слов.
+Выбирай длину ответа по смыслу вопроса.
 
-Учитывай предыдущие реплики диалога.
+На простой фактический вопрос отвечай коротко и прямо,
+обычно одним-двумя предложениями.
+
+На вопросы, требующие объяснения, давай законченный ответ
+с достаточным количеством деталей.
+
+Если пользователь просит анализ, прогноз, сравнение,
+развёрнутое объяснение, историю или подробный рассказ,
+отвечай подробнее, обычно до 150-250 слов.
+
+Не сокращай ответ настолько, чтобы пользователю приходилось
+просить "продолжай" для получения основной информации.
+
+Если пользователь говорит:
+"короче" — сократи следующий ответ;
+"подробнее" — дай больше деталей;
+"объясни проще" — объясни простыми словами;
+"продолжай" — продолжи предыдущую мысль без повторения начала.
+
+Всегда учитывай предыдущие реплики диалога.
+
 Если пользователь говорит "он", "она", "у него", "у неё",
-"а сколько у неё", "а когда это было" и подобное,
-определи объект по предыдущим репликам.
+"это", "там", "тот", "эта", "ему", "ей" и подобные слова,
+определи, к чему они относятся из предыдущего контекста.
 
-Не используй Markdown, списки и служебные пояснения.
+Не задавай уточняющий вопрос, если смысл очевиден
+из предыдущих реплик.
+
+Не используй Markdown, таблицы и служебные пояснения.
+
 Не говори, что ты Алиса.
+
+Избегай лишней воды и повторов.
 """
 
 
 def alice_response(text, end_session=False):
-    """Формирует правильный JSON для Яндекс Диалогов."""
-
     return jsonify({
         "response": {
             "text": text,
@@ -57,7 +78,7 @@ def alice_response(text, end_session=False):
 def quick_answer(text):
     """
     Мгновенные локальные ответы.
-    Они вообще не обращаются к OpenAI.
+    OpenAI для них не вызывается.
     """
 
     t = text.lower().strip()
@@ -76,9 +97,6 @@ def quick_answer(text):
     if t in greetings:
         return "Привет! Я Эл. Чем могу помочь?"
 
-    # Простая арифметика вида:
-    # 3 умножить на 8
-    # 17 * 23
     multiplication = re.fullmatch(
         r"\s*(-?\d+(?:[.,]\d+)?)\s*"
         r"(?:умножить\s+на|×|\*)\s*"
@@ -95,7 +113,11 @@ def quick_answer(text):
             if result.is_integer():
                 result = int(result)
 
-            return f"{multiplication.group(1)} умножить на {multiplication.group(2)} равно {result}."
+            return (
+                f"{multiplication.group(1)} умножить на "
+                f"{multiplication.group(2)} равно {result}."
+            )
+
         except Exception:
             pass
 
@@ -112,13 +134,11 @@ def health():
 
 @app.post("/ask")
 def ask():
-
     started = time.time()
 
     try:
         data = request.get_json(silent=True) or {}
 
-        # Определяем, пришёл запрос от Алисы или обычный JSON.
         is_alice = (
             isinstance(data, dict)
             and "request" in data
@@ -126,7 +146,6 @@ def ask():
         )
 
         if is_alice:
-
             req = data.get("request", {})
             session = data.get("session", {})
 
@@ -136,57 +155,62 @@ def ask():
                 or ""
             ).strip()
 
-            session_id = session.get("session_id", "default")
+            session_id = session.get(
+                "session_id",
+                "default"
+            )
 
         else:
+            text = str(
+                data.get("text", "")
+            ).strip()
 
-            text = str(data.get("text", "")).strip()
-            session_id = str(data.get("session_id", "default"))
+            session_id = str(
+                data.get("session_id", "default")
+            )
 
         print(
             f"SESSION: {session_id} | INPUT: {text}",
             flush=True
         )
 
-        # -------------------------------------------------
         # Пустой запрос
-        # -------------------------------------------------
-
         if not text:
-
             answer = "Привет! Я Эл. Чем могу помочь?"
 
             if is_alice:
                 return alice_response(answer)
 
-            return jsonify({"answer": answer})
+            return jsonify({
+                "answer": answer
+            })
 
-
-        # -------------------------------------------------
         # Быстрый локальный ответ
-        # -------------------------------------------------
-
         answer = quick_answer(text)
 
         if answer:
-
-            print("LOCAL ANSWER", flush=True)
+            print(
+                "LOCAL ANSWER",
+                flush=True
+            )
 
             if is_alice:
                 return alice_response(answer)
 
-            return jsonify({"answer": answer})
+            return jsonify({
+                "answer": answer
+            })
 
+        # История текущей сессии
+        history = sessions.get(
+            session_id,
+            []
+        )
 
-        # -------------------------------------------------
-        # История разговора
-        # -------------------------------------------------
-
-        history = sessions.get(session_id, [])
-
-        # Ограничиваем историю последними репликами,
-        # чтобы запрос оставался быстрым.
-        history = history[-6:]
+        # Держим несколько последних реплик.
+        # Этого достаточно для нормального контекста
+        # и не слишком раздувает запрос.
+        history = history[-8:]
 
         conversation = []
 
@@ -201,15 +225,9 @@ def ask():
             "content": text
         })
 
-
-        # -------------------------------------------------
-        # OpenAI
-        # -------------------------------------------------
-
         openai_started = time.time()
 
         try:
-
             response = client.responses.create(
                 model="gpt-5.5",
                 instructions=SYSTEM_PROMPT,
@@ -217,19 +235,22 @@ def ask():
                 reasoning={
                     "effort": "low"
                 },
-                max_output_tokens=100,
+                max_output_tokens=400,
                 timeout=4.5
             )
 
-            answer = (response.output_text or "").strip()
+            answer = (
+                response.output_text
+                or ""
+            ).strip()
 
             print(
-                f"OPENAI TIME: {time.time() - openai_started:.2f}s",
+                f"OPENAI TIME: "
+                f"{time.time() - openai_started:.2f}s",
                 flush=True
             )
 
         except APITimeoutError:
-
             print(
                 f"OPENAI TIMEOUT after "
                 f"{time.time() - openai_started:.2f}s",
@@ -242,36 +263,36 @@ def ask():
             )
 
         except APIError as e:
-
             print(
-                f"OPENAI API ERROR: {type(e).__name__}: {e}",
+                f"OPENAI API ERROR: "
+                f"{type(e).__name__}: {e}",
                 flush=True
             )
 
-            answer = "Сейчас не удалось получить ответ. Повторите вопрос."
+            answer = (
+                "Сейчас не удалось получить ответ. "
+                "Повторите вопрос."
+            )
 
         except Exception as e:
-
             print(
-                f"OPENAI ERROR: {type(e).__name__}: {e}",
+                f"OPENAI ERROR: "
+                f"{type(e).__name__}: {e}",
                 flush=True
             )
 
-            answer = "Сейчас не удалось получить ответ. Повторите вопрос."
-
-
-        # -------------------------------------------------
-        # Защита от пустого ответа
-        # -------------------------------------------------
+            answer = (
+                "Сейчас не удалось получить ответ. "
+                "Повторите вопрос."
+            )
 
         if not answer:
-            answer = "Не удалось сформировать ответ. Повторите вопрос."
+            answer = (
+                "Не удалось сформировать ответ. "
+                "Повторите вопрос."
+            )
 
-
-        # -------------------------------------------------
-        # Сохраняем историю
-        # -------------------------------------------------
-
+        # Сохраняем только сам разговор
         history.append({
             "role": "user",
             "content": text
@@ -282,8 +303,7 @@ def ask():
             "content": answer
         })
 
-        sessions[session_id] = history[-8:]
-
+        sessions[session_id] = history[-10:]
 
         total_time = time.time() - started
 
@@ -292,33 +312,29 @@ def ask():
             flush=True
         )
 
-
-        # -------------------------------------------------
-        # Ответ Алисе
-        # -------------------------------------------------
-
         if is_alice:
             return alice_response(answer)
 
-        # Обычный API
         return jsonify({
             "answer": answer
         })
 
-
     except Exception as e:
-
         print(
-            f"FATAL ERROR: {type(e).__name__}: {e}",
+            f"FATAL ERROR: "
+            f"{type(e).__name__}: {e}",
             flush=True
         )
 
-        # Даже при неожиданной ошибке возвращаем Алисе
-        # корректный ответ, а не HTTP 500.
         try:
-            data = request.get_json(silent=True) or {}
+            data = request.get_json(
+                silent=True
+            ) or {}
 
-            if "request" in data and "session" in data:
+            if (
+                "request" in data
+                and "session" in data
+            ):
                 return alice_response(
                     "Произошла ошибка. Повторите вопрос."
                 )
@@ -332,8 +348,12 @@ def ask():
 
 
 if __name__ == "__main__":
-
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
