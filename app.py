@@ -1123,6 +1123,8 @@ def send_email_background(
 
 def build_information_package(topic):
 
+    full_text = ""
+
     response = client.responses.create(
 
         model=MODEL_NAME,
@@ -1130,30 +1132,53 @@ def build_information_package(topic):
         instructions=EMAIL_SYSTEM_PROMPT,
 
         input=(
-            "Подготовь информационный пакет "
-            f"по теме: {topic}"
+            "Подготовь полный и подробный информационный пакет "
+            f"по теме: {topic}. "
+            "Раскрой тему полностью. "
+            "Обязательно закончи материал выводом. "
+            "Не обрывай последнюю фразу."
         ),
 
         reasoning={
             "effort": "none"
         },
 
-        max_output_tokens=1000,
+        max_output_tokens=1600,
 
         timeout=EMAIL_OPENAI_TIMEOUT
     )
 
 
-    text = (
+    part = (
         response.output_text
         or ""
     ).strip()
 
 
-    # Если пакет упёрся в лимит —
-    # один раз автоматически продолжаем.
-    if response_needs_continuation(
-        response
+    if part:
+        full_text += part
+
+
+    print(
+        f"EMAIL PACKAGE PART 1 | "
+        f"STATUS: {getattr(response, 'status', None)} | "
+        f"REASON: {get_incomplete_reason(response)} | "
+        f"LENGTH: {len(part)}",
+        flush=True
+    )
+
+
+    # -----------------------------------------------------
+    # Продолжаем автоматически, пока модель не завершит пакет
+    # -----------------------------------------------------
+
+    max_parts = 6
+    part_number = 1
+
+
+    while (
+        response_needs_continuation(response)
+        and part_number < max_parts
     ):
 
         previous_id = getattr(
@@ -1163,51 +1188,97 @@ def build_information_package(topic):
         )
 
 
-        if previous_id:
+        if not previous_id:
+            break
 
-            continuation = (
-                client.responses.create(
 
-                    model=MODEL_NAME,
+        part_number += 1
 
-                    instructions=EMAIL_SYSTEM_PROMPT,
 
-                    previous_response_id=(
-                        previous_id
-                    ),
+        response = client.responses.create(
 
-                    input=(
-                        "Продолжи информационный пакет. "
-                        "Не повторяй уже написанное "
-                        "и обязательно закончи материал."
-                    ),
+            model=MODEL_NAME,
 
-                    reasoning={
-                        "effort": "none"
-                    },
+            instructions=EMAIL_SYSTEM_PROMPT,
 
-                    max_output_tokens=800,
+            previous_response_id=previous_id,
 
-                    timeout=EMAIL_OPENAI_TIMEOUT
-                )
+            input=(
+                "Продолжи информационный пакет точно с того места, "
+                "где закончился предыдущий текст. "
+                "Не повторяй уже написанное. "
+                "Раскрой оставшиеся важные вопросы и обязательно "
+                "заверши весь материал полноценным итогом. "
+                "Последнее предложение должно быть законченным."
+            ),
+
+            reasoning={
+                "effort": "none"
+            },
+
+            max_output_tokens=1600,
+
+            timeout=EMAIL_OPENAI_TIMEOUT
+        )
+
+
+        part = (
+            response.output_text
+            or ""
+        ).strip()
+
+
+        if part:
+
+            if full_text:
+                full_text += "\n\n"
+
+            full_text += part
+
+
+        print(
+            f"EMAIL PACKAGE PART {part_number} | "
+            f"STATUS: {getattr(response, 'status', None)} | "
+            f"REASON: {get_incomplete_reason(response)} | "
+            f"LENGTH: {len(part)}",
+            flush=True
+        )
+
+
+    # -----------------------------------------------------
+    # Защита от оборванной последней фразы
+    # -----------------------------------------------------
+
+    if full_text:
+
+        stripped = full_text.rstrip()
+
+        if stripped[-1:] not in ".!?…":
+
+            last_sentence_end = max(
+                stripped.rfind("."),
+                stripped.rfind("!"),
+                stripped.rfind("?"),
+                stripped.rfind("…")
             )
 
-
-            continuation_text = (
-                continuation.output_text
-                or ""
-            ).strip()
-
-
-            if continuation_text:
-
-                text += (
-                    "\n\n"
-                    + continuation_text
-                )
+            if last_sentence_end > 0:
+                full_text = stripped[
+                    :last_sentence_end + 1
+                ]
 
 
-    return text
+    print(
+        f"EMAIL PACKAGE COMPLETE | "
+        f"PARTS: {part_number} | "
+        f"TOTAL LENGTH: {len(full_text)} | "
+        f"FINAL STATUS: {getattr(response, 'status', None)} | "
+        f"FINAL REASON: {get_incomplete_reason(response)}",
+        flush=True
+    )
+
+
+    return full_text
 
 
 def build_and_send_package(
